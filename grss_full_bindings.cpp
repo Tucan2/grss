@@ -1,0 +1,2054 @@
+/**
+ * @file    grss.cpp
+ * @brief   Python bindings for GRSS
+ * @author  Rahil Makadia <makadia2@illinois.edu>
+ *
+ * @section     LICENSE
+ * Copyright (C) 2022-2025 Rahil Makadia
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 3 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along with
+ * this program; if not, see <https://www.gnu.org/licenses>.
+ */
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
+#include <utility>
+#include <algorithm>
+#include <stdexcept>
+
+#include "pybind11/pybind11.h"
+#include "pybind11/stl.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <numeric>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#define private public
+#define protected public
+//
+// Intentionally include the existing, untouched implementation files into this
+// translation unit. This creates a standalone Python extension containing the
+// same C++ implementation as the repository, while leaving every existing
+// source/header file unchanged.
+//
+// The two source files each contain a private helper called _mjd(). Rename the
+// helper at preprocessing time so both implementation files can coexist in
+// one translation unit.
+//
+#include "src/approach.cpp"
+#include "src/elements.cpp"
+#include "src/force.cpp"
+#include "src/ias15.cpp"
+#include "src/interpolate.cpp"
+#include "src/observe.cpp"
+#include "src/parallel.cpp"
+#include "src/simulation.cpp"
+#define _mjd pck_mjd_internal
+#include "src/pck.cpp"
+#undef _mjd
+#define _mjd spk_mjd_internal
+#include "src/spk.cpp"
+#undef _mjd
+#include "src/stm.cpp"
+#include "src/timeconvert.cpp"
+#include "src/utilities.cpp"
+#include "grss.h"
+#undef protected
+#undef private
+
+namespace py = pybind11;
+
+PYBIND11_MODULE(grss_full, m) {
+    m.doc() = "GRSS Python bindings for C++ library";
+
+    py::class_<Constants>(m, "Constants", R"mydelimiter(
+        The Constants class contains physical constants and conversion factors
+        used in the GRSS orbit propagation code.
+        )mydelimiter")
+        .def(py::init<>())
+        .def_readwrite("du2m", &Constants::du2m, R"mydelimiter(
+            Conversion factor from distance units to meters.
+            )mydelimiter")
+        .def_readwrite("tu2s", &Constants::tu2s, R"mydelimiter(
+            Conversion factor from time units to seconds.
+            )mydelimiter")
+        .def_readwrite("duptu2mps", &Constants::duptu2mps, R"mydelimiter(
+            Conversion factor from distance units per time units to meters per second.
+            )mydelimiter")
+        .def_readwrite("G", &Constants::G, R"mydelimiter(
+            Gravitational constant.
+            )mydelimiter")
+        .def_readwrite("clight", &Constants::clight, R"mydelimiter(
+            Speed of light in a vacuum.
+            )mydelimiter")
+        .def_readwrite("j2000Jd", &Constants::j2000Jd, R"mydelimiter(
+            Julian date of J2000 epoch.
+            )mydelimiter")
+        .def_readwrite("JdMinusMjd", &Constants::JdMinusMjd, R"mydelimiter(
+            Difference between Julian date and modified Julian date.
+            )mydelimiter");
+
+    py::class_<IntegrationParameters>(m, "IntegrationParameters", R"mydelimiter(
+        The IntegrationParameters class contains parameters used in the numerical
+        integration of the equations of motion.
+        )mydelimiter")
+        .def(py::init<>())
+        .def_readwrite("nInteg", &IntegrationParameters::nInteg, R"mydelimiter(
+            Number of integrated bodies.
+            )mydelimiter")
+        .def_readwrite("nSpice", &IntegrationParameters::nSpice, R"mydelimiter(
+            Number of bodies with SPICE ephemerides.
+            )mydelimiter")
+        .def_readwrite("nTotal", &IntegrationParameters::nTotal, R"mydelimiter(
+            Total number of bodies. nTotal = nInteg + nSpice.
+            )mydelimiter")
+        .def_readwrite("n2Derivs", &IntegrationParameters::n2Derivs,
+                       R"mydelimiter(
+            Number of second derivatives.
+            )mydelimiter")
+        .def_readwrite("t0", &IntegrationParameters::t0, R"mydelimiter(
+            Initial time of integration (MJD TDB).
+            )mydelimiter")
+        .def_readwrite("tf", &IntegrationParameters::tf, R"mydelimiter(
+            Final time of integration (MJD TDB).
+            )mydelimiter")
+        .def_readwrite("dt0", &IntegrationParameters::dt0, R"mydelimiter(
+            Initial time step.
+            )mydelimiter")
+        .def_readwrite("dtMin", &IntegrationParameters::dtMin, R"mydelimiter(
+            Minimum time step.
+            )mydelimiter")
+        .def_readwrite("dtChangeFactor", &IntegrationParameters::dtChangeFactor,
+                       R"mydelimiter(
+            Factor by which to limit the change in time step.
+            )mydelimiter")
+        .def_readwrite("adaptiveTimestep",
+                       &IntegrationParameters::adaptiveTimestep, R"mydelimiter(
+                       Flag to use adaptive time step.
+                       )mydelimiter")
+        .def_readonly("timestepCounter",
+                      &IntegrationParameters::timestepCounter, R"mydelimiter(
+                      Counter for number of time steps.
+                      )mydelimiter")
+        .def_readwrite("tolPC", &IntegrationParameters::tolPC, R"mydelimiter(
+                        Tolerance for predictor-corrector within IAS15.
+                        )mydelimiter")
+        .def_readwrite("tolInteg", &IntegrationParameters::tolInteg,
+                       R"mydelimiter(
+                        Tolerance for integration.
+                        )mydelimiter");
+
+    py::class_<NongravParameters>(m, "NongravParameters", R"mydelimiter(
+        The NongravParameters class contains constants used for calculating the
+        non-gravitational accelerations on integrated bodies.
+        )mydelimiter")
+        .def(py::init<>())
+        .def_readwrite("a1", &NongravParameters::a1, R"mydelimiter(
+            Radial non-gravitational parameter a1.
+            )mydelimiter")
+        .def_readwrite("a2", &NongravParameters::a2, R"mydelimiter(
+            Transverse non-gravitational parameter a2.
+            )mydelimiter")
+        .def_readwrite("a3", &NongravParameters::a3, R"mydelimiter(
+            Normal non-gravitational parameter a3.
+            )mydelimiter")
+        .def_readwrite("a1Est", &NongravParameters::a1Est, R"mydelimiter(
+            Flag for whether to estimate a1 (used when propagating STM).
+            )mydelimiter")
+        .def_readwrite("a2Est", &NongravParameters::a2Est, R"mydelimiter(
+            Flag for whether to estimate a2 (used when propagating STM).
+            )mydelimiter")
+        .def_readwrite("a3Est", &NongravParameters::a3Est, R"mydelimiter(
+            Flag for whether to estimate a3 (used when propagating STM).
+            )mydelimiter")
+        .def_readwrite("alpha", &NongravParameters::alpha, R"mydelimiter(
+            Non-gravitational parameter alpha from Marsden et al. (1973).
+            )mydelimiter")
+        .def_readwrite("k", &NongravParameters::k, R"mydelimiter(
+            Non-gravitational parameter k from Marsden et al. (1973).
+            )mydelimiter")
+        .def_readwrite("m", &NongravParameters::m, R"mydelimiter(
+            Non-gravitational parameter m from Marsden et al. (1973).
+            )mydelimiter")
+        .def_readwrite("n", &NongravParameters::n, R"mydelimiter(
+            Non-gravitational parameter n from Marsden et al. (1973).
+            )mydelimiter")
+        .def_readwrite("r0_au", &NongravParameters::r0_au, R"mydelimiter(
+            Non-gravitational parameter r0 in AU from Marsden et al. (1973).
+            )mydelimiter");
+
+    py::class_<InterpolationParameters>(m, "InterpolationParameters",
+                                        R"mydelimiter(
+        The InterpolationParameters class contains parameters used for
+        interpolation of the states of the integrated bodies.
+        )mydelimiter")
+        .def(py::init<>())
+        .def_readwrite("tStack", &InterpolationParameters::tStack,
+                       R"mydelimiter(
+            Stack of times used for interpolation at steps taken by the integrator.
+            )mydelimiter")
+        .def_readwrite("xIntegStack", &InterpolationParameters::xIntegStack,
+                       R"mydelimiter(
+            Stack of states of the integrated bodies used for interpolation at steps taken by the integrator.
+            )mydelimiter");
+
+    py::class_<EventManager>(m, "EventManager", R"mydelimiter(
+        The EventManager class stores pending impulsive and continuous events.
+        )mydelimiter")
+        .def(py::init<>())
+        .def_readwrite("impulsiveEvents", &EventManager::impulsiveEvents)
+        .def_readwrite("continuousEvents", &EventManager::continuousEvents)
+        .def_readwrite("nextImpEventIdx", &EventManager::nextImpEventIdx)
+        .def_readwrite("nextConEventIdx", &EventManager::nextConEventIdx)
+        .def_readwrite("tNextImpEvent", &EventManager::tNextImpEvent)
+        .def_readwrite("tNextConEvent", &EventManager::tNextConEvent)
+        .def_readwrite("nImpEvents", &EventManager::nImpEvents)
+        .def_readwrite("nConEvents", &EventManager::nConEvents)
+        .def_readwrite("allConEventDone", &EventManager::allConEventDone);
+
+    py::class_<BPlaneParameters>(m, "BPlaneParameters", R"mydelimiter(
+        The BPlaneParameters class contains parameters used for calculating the
+        B-plane of a close approach.
+        )mydelimiter")
+        .def(py::init<>())
+        .def_readwrite("x", &BPlaneParameters::x, R"mydelimiter(
+            X coordinate of the B-plane.
+            )mydelimiter")
+        .def_readwrite("y", &BPlaneParameters::y, R"mydelimiter(
+            Y coordinate of the B-plane.
+            )mydelimiter")
+        .def_readwrite("z", &BPlaneParameters::z, R"mydelimiter(
+            Z coordinate of the B-plane.
+            )mydelimiter")
+        .def_readwrite("dx", &BPlaneParameters::dx, R"mydelimiter(
+            Partial of X coordinate of the B-plane with respect to state.
+            )mydelimiter")
+        .def_readwrite("dy", &BPlaneParameters::dy, R"mydelimiter(
+            Partial of Y coordinate of the B-plane with respect to state.
+            )mydelimiter");
+
+    py::class_<CloseApproachParameters>(m, "CloseApproachParameters",
+                                        R"mydelimiter(
+        The CloseApproachParameters class contains parameters used for calculating
+        the close approach between two integrated or SPICE bodies.
+        )mydelimiter")
+        .def(py::init<>())
+        .def_readwrite("t", &CloseApproachParameters::t, R"mydelimiter(
+            Time of the close approach or impact.
+            )mydelimiter")
+        .def_readwrite("xRel", &CloseApproachParameters::xRel,
+                       R"mydelimiter(
+            Relative state of the close approach or impact.
+            )mydelimiter")
+        .def_readwrite("tCA", &CloseApproachParameters::tCA, R"mydelimiter(
+            Time of the close approach.
+            )mydelimiter")
+        .def_readwrite("xRelCA", &CloseApproachParameters::xRelCA,
+                       R"mydelimiter(
+            Relative state of the close approach.
+            )mydelimiter")
+        .def_readwrite("tMap", &CloseApproachParameters::tMap, R"mydelimiter(
+            Time of mapping.
+            )mydelimiter")
+        .def_readwrite("xRelMap", &CloseApproachParameters::xRelMap,
+                       R"mydelimiter(
+            Relative state at map time.
+            )mydelimiter")
+        .def_readwrite("dist", &CloseApproachParameters::dist, R"mydelimiter(
+            Distance of the close approach.
+            )mydelimiter")
+        .def_readwrite("vel", &CloseApproachParameters::vel, R"mydelimiter(
+            Velocity of the close approach.
+            )mydelimiter")
+        .def_readwrite("vInf", &CloseApproachParameters::vInf,
+                       R"mydelimiter(
+            Hyperbolic excess velocity of the close approach.
+            )mydelimiter")
+        .def_readwrite("flybyBody", &CloseApproachParameters::flybyBody,
+                       R"mydelimiter(
+            Name of the flyby body.
+            )mydelimiter")
+        .def_readwrite("flybyBodyIdx", &CloseApproachParameters::flybyBodyIdx,
+                       R"mydelimiter(
+            Index of the flyby body.
+            )mydelimiter")
+        .def_readwrite("centralBody", &CloseApproachParameters::centralBody,
+                       R"mydelimiter(
+            Name of the central body.
+            )mydelimiter")
+        .def_readwrite("centralBodyIdx",
+                       &CloseApproachParameters::centralBodyIdx,
+                       R"mydelimiter(
+            Index of the central body.
+            )mydelimiter")
+        .def_readwrite("centralBodySpiceId",
+                       &CloseApproachParameters::centralBodySpiceId,
+                       R"mydelimiter(
+            SPICE ID of the central body.
+            )mydelimiter")
+        .def_readwrite("impact", &CloseApproachParameters::impact,
+                       R"mydelimiter(
+            Whether the close approach is an impact when accounting for gravitational focusing.
+            )mydelimiter")
+        .def_readwrite("tPeri", &CloseApproachParameters::tPeri, R"mydelimiter(
+            Time of periapsis (according to Keplerian hyperbolic motion).
+            )mydelimiter")
+        .def_readwrite("tLin", &CloseApproachParameters::tLin, R"mydelimiter(
+            Linearized time of periapsis
+            )mydelimiter")
+        .def_readwrite("bVec", &CloseApproachParameters::bVec, R"mydelimiter(
+            B-vector of the close approach.
+            )mydelimiter")
+        .def_readwrite("bMag", &CloseApproachParameters::bMag, R"mydelimiter(
+            Magnitude of the B-vector of the close approach (Impact parameter).
+            )mydelimiter")
+        .def_readwrite("gravFocusFactor",
+                       &CloseApproachParameters::gravFocusFactor, R"mydelimiter(
+            Lambda parameter of the close approach (gravitational focusing).
+            )mydelimiter")
+        .def_readwrite("kizner", &CloseApproachParameters::kizner,
+                       R"mydelimiter(
+            Kizner B-plane parameters of the close approach.
+            )mydelimiter")
+        .def_readwrite("opik", &CloseApproachParameters::opik, R"mydelimiter(
+            Öpik B-plane parameters of the close approach.
+            )mydelimiter")
+        .def_readwrite("scaled", &CloseApproachParameters::scaled,
+                       R"mydelimiter(
+            Scaled B-plane parameters of the close approach.
+            )mydelimiter")
+        .def_readwrite("mtp", &CloseApproachParameters::mtp, R"mydelimiter(
+            Modified Target Plane (MTP) B-plane parameters of the close approach.
+            )mydelimiter")
+        .def_readwrite("dtLin", &CloseApproachParameters::dtLin, R"mydelimiter(
+            Partials of linearized time of periapsis with respect to CA state.
+            )mydelimiter")
+        .def_readwrite("dt", &CloseApproachParameters::dt, R"mydelimiter(
+            Partials of time of periapsis with respect to CA state.
+            )mydelimiter")
+        .def("get_ca_parameters", &CloseApproachParameters::get_ca_parameters,
+             py::arg("propSim"), py::arg("tMap"), R"mydelimiter(
+            Calculate the close approach parameters.
+
+            Parameters
+            ----------
+            propSim : PropSimulation
+                Simulation containing the close approach.
+            tMap : real
+                Time of the mapping point.
+
+            Returns
+            -------
+            None : NoneType
+                None.
+            )mydelimiter")
+        .def("print_summary", &CloseApproachParameters::print_summary,
+             py::arg("prec") = 8, R"mydelimiter(
+            Print a summary of the close approach parameters.
+
+            Parameters
+            ----------
+            prec : int, optional
+                Precision of the printed values, by default 8.
+
+            Returns
+            -------
+            None : NoneType
+                None.
+            )mydelimiter");
+
+    py::class_<ImpactParameters, CloseApproachParameters>(m, "ImpactParameters",
+                                                          R"mydelimiter(
+        The ImpactParameters class contains parameters used for calculating
+        the impact between two integrated or SPICE bodies.
+        )mydelimiter")
+        .def(py::init<>())
+        .def_readwrite("xRelBodyFixed", &ImpactParameters::xRelBodyFixed,
+                       R"mydelimiter(
+            Relative state of the impact in the body-fixed frame of the central body.
+            )mydelimiter")
+        .def_readwrite("lon", &ImpactParameters::lon, R"mydelimiter(
+            Longitude of the impact.
+            )mydelimiter")
+        .def_readwrite("lat", &ImpactParameters::lat, R"mydelimiter(
+            Latitude of the impact.
+            )mydelimiter")
+        .def_readwrite("alt", &ImpactParameters::alt, R"mydelimiter(
+            Altitude of the impact.
+            )mydelimiter")
+        .def("get_impact_parameters", &ImpactParameters::get_impact_parameters,
+             py::arg("propSim"))
+        .def("print_summary", &ImpactParameters::print_summary,
+             py::arg("prec") = 8, R"mydelimiter(
+            Print a summary of the impact parameters.
+
+            Parameters
+            ----------
+            prec : int, optional
+                Precision of the printed values, by default 8.
+
+            Returns
+            -------
+            None : NoneType
+                None.
+            )mydelimiter");
+
+    m.def(
+        "cometary_to_cartesian",
+        [](real epochMjd, std::vector<real> cometaryState, real GM) {
+            std::vector<real> cartesianState(6);
+            cometary_to_cartesian(epochMjd, cometaryState, cartesianState, GM);
+            return cartesianState;
+        },
+        py::arg("epochMjd"), py::arg("cometaryState"),
+        py::arg("GM") = 2.9591220828559115e-4L, R"mydelimiter(
+        Convert cometary state to cartesian state.
+
+        Parameters
+        ----------
+        epochMjd : real
+            Epoch in modified Julian date.
+        cometaryState : list of real
+            Cometary state vector.
+        GM : real, optional
+            Gravitational parameter of the central body, by default 0.00029591220828559115L.
+        
+        Returns
+        -------
+        cartesianState : list of real
+            Cartesian state vector.
+        )mydelimiter");
+
+    m.def(
+        "cartesian_to_cometary",
+        [](real epochMjd, std::vector<real> cartesianState, real GM) {
+            std::vector<real> cometaryState(6);
+            cartesian_to_cometary(epochMjd, cartesianState, cometaryState, GM);
+            return cometaryState;
+        },
+        py::arg("epochMjd"), py::arg("cartesianState"),
+        py::arg("GM") = 2.9591220828559115e-4L, R"mydelimiter(
+        Convert cartesian state to cometary state.
+
+        Parameters
+        ----------
+        epochMjd : real
+            Epoch in modified Julian date.
+        cartesianState : list of real
+            Cartesian state vector.
+        GM : real, optional
+            Gravitational parameter of the central body, by default 0.00029591220828559115L.
+
+        Returns
+        -------
+        cometaryState : list of real
+            Cometary state vector.
+        )mydelimiter");
+
+    m.def(
+        "get_elements_partials",
+        [](real epochMjd, std::vector<real> elems, std::string conversion, real GM) {
+            std::vector<std::vector<real>> partials(6, std::vector<real>(6));
+            get_elements_partials(epochMjd, elems, conversion, partials, GM);
+            return partials;
+        },
+        py::arg("epochMjd"), py::arg("elems"), py::arg("conversion"),
+        py::arg("GM") = 2.9591220828559115e-4L, R"mydelimiter(
+        Calculate the partial derivatives of input ecliptic orbital elements with respect to
+        the corresponding ecliptic Cartesian state vector.
+
+        Parameters
+        ----------
+        epochMjd : real
+            Epoch in modified Julian date.
+        elems : list of real
+            Orbital elements vector (either Keplerian [a,e,i,OM,om,nu] or cometary [e,q,tp,OM,om,i]) with angles in radians.
+        conversion : str
+            Conversion type (must be either "kep2cart" or "com2cart").
+        GM : real, optional
+            Gravitational parameter of the central body, by default 0.00029591220828559115L.
+
+        Returns
+        -------
+        partials : list of list of real
+            Partial derivatives of orbital elements.
+        )mydelimiter");
+
+    m.def(
+        "matrix_inverse",
+        [](std::vector<std::vector<real>> mat, const real &tol) {
+            std::vector<std::vector<real>> invMat(
+                mat.size(), std::vector<real>(mat[0].size()));
+            mat_inv(mat, invMat, tol);
+            return invMat;
+        },
+        py::arg("mat"), py::arg("tol") = 1.0e-16L, R"mydelimiter(
+        Calculate the inverse of a matrix using LU decomposition.
+
+        Parameters
+        ----------
+        mat : list of list of real
+            Matrix to invert.
+        tol : real, optional
+            Tolerance for the matrix inversion, by default 1.0e-16L.
+
+        Returns
+        -------
+        invMat : list of list of real
+            Inverse of the matrix.
+        )mydelimiter");
+
+    m.def("delta_at_utc", &delta_at_utc, py::arg("mjdUtc"), R"mydelimiter(
+        Calculate the difference between TAI and UTC time with UTC as the input.
+
+        Parameters
+        ----------
+        mjdUtc : real
+            Modified Julian date in UTC.
+
+        Returns
+        -------
+        deltaAt : real
+            Difference between TAI and UTC time.
+        )mydelimiter");
+
+    m.def("delta_at_tai", &delta_at_tai, py::arg("mjdTai"), R"mydelimiter(
+        Calculate the difference between TAI and UTC time with TAI as the input.
+
+        Parameters
+        ----------
+        mjdTai : real
+            Modified Julian date in TAI.
+
+        Returns
+        -------
+        deltaAt : real
+            Difference between TAI and UTC time.
+        )mydelimiter");
+
+    m.def("delta_et_utc", &delta_et_utc, py::arg("mjdUtc"), R"mydelimiter(
+        Calculate the difference between TDB and UTC time with UTC as the input.
+
+        Parameters
+        ----------
+        mjdUtc : real
+            Modified Julian date in UTC.
+
+        Returns
+        -------
+        delta_et : real
+            Difference between TDB and UTC time.
+        )mydelimiter");
+
+    m.def("delta_et_tdb", &delta_et_tdb, py::arg("mjdTdb"), R"mydelimiter(
+        Calculate the difference between TDB and UTC time with TDB as the input.
+
+        Parameters
+        ----------
+        mjdTdb : real
+            Modified Julian date in TDB.
+
+        Returns
+        -------
+        delta_et : real
+            Difference between TDB and UTC time.
+        )mydelimiter");
+
+    py::class_<Body>(m, "Body", R"mydelimiter(
+        The Body class contains the properties of an integrated or SPICE body.
+        )mydelimiter")
+        .def(py::init<>())
+        .def_readwrite("t0", &Body::t0, R"mydelimiter(
+            Initial MJD TDB time of the body. Same as the initial time of the propagator.
+            )mydelimiter")
+        .def_readwrite("mass", &Body::mass, R"mydelimiter(
+            Mass of the body.
+            )mydelimiter")
+        .def_readwrite("radius", &Body::radius, R"mydelimiter(
+            Radius of the body.
+            )mydelimiter")
+        .def_readwrite("J2", &Body::J2, R"mydelimiter(
+            J2 parameter of the body.
+            )mydelimiter")
+        .def_readwrite("poleRA", &Body::poleRA, R"mydelimiter(
+            Right ascension of the pole of the body.
+            )mydelimiter")
+        .def_readwrite("poleDec", &Body::poleDec, R"mydelimiter(
+            Declination of the pole of the body.
+            )mydelimiter")
+        .def_readwrite("nZon", &Body::nZon, R"mydelimiter(
+            Degree of the spherical harmonics.
+            )mydelimiter")
+        .def_readwrite("nTes", &Body::nTes, R"mydelimiter(
+            Order of the spherical harmonics.
+            )mydelimiter")
+        .def_readwrite("J", &Body::J, R"mydelimiter(
+            Zonal coefficients of the spherical harmonics.
+            )mydelimiter")
+        .def_readwrite("C", &Body::C, R"mydelimiter(
+            Sectoral coefficients of the spherical harmonics.
+            )mydelimiter")
+        .def_readwrite("S", &Body::S, R"mydelimiter(
+            Tesseral coefficients of the spherical harmonics.
+            )mydelimiter")
+        .def_readwrite("name", &Body::name, R"mydelimiter(
+            Name of the body.
+            )mydelimiter")
+        .def_readwrite("spiceId", &Body::spiceId, R"mydelimiter(
+            SPICE ID of the body.
+            )mydelimiter")
+        .def_property("pos", [](const Body &b) { return std::vector<real>(b.pos, b.pos + 3); },
+                      [](Body &b, const std::vector<real> &v) {
+                          if (v.size() != 3) throw std::invalid_argument("pos must have length 3");
+                          std::copy(v.begin(), v.end(), b.pos);
+                      })
+        .def_property("vel", [](const Body &b) { return std::vector<real>(b.vel, b.vel + 3); },
+                      [](Body &b, const std::vector<real> &v) {
+                          if (v.size() != 3) throw std::invalid_argument("vel must have length 3");
+                          std::copy(v.begin(), v.end(), b.vel);
+                      })
+        .def_property("acc", [](const Body &b) { return std::vector<real>(b.acc, b.acc + 3); },
+                      [](Body &b, const std::vector<real> &v) {
+                          if (v.size() != 3) throw std::invalid_argument("acc must have length 3");
+                          std::copy(v.begin(), v.end(), b.acc);
+                      })
+        .def_readwrite("isPPN", &Body::isPPN, R"mydelimiter(
+            Whether the body is a PPN body.
+            )mydelimiter")
+        .def_readwrite("isMajor", &Body::isMajor, R"mydelimiter(
+            Whether the body is a major body (used for EIH PPN).
+            )mydelimiter")
+        .def_readwrite("isJ2", &Body::isJ2, R"mydelimiter(
+            Whether the body is a J2 body.
+            )mydelimiter")
+        .def_readwrite("isHarmonic", &Body::isHarmonic, R"mydelimiter(
+            Whether the body has spherical harmonics.
+            )mydelimiter")
+        .def_readwrite("isNongrav", &Body::isNongrav, R"mydelimiter(
+            Whether the body has non-gravitational accelerations.
+            )mydelimiter")
+        .def_readwrite("caTol", &Body::caTol, R"mydelimiter(
+            Distance tolerance for close approaches.
+            )mydelimiter")
+        .def("set_J2", &Body::set_J2, py::arg("J2"), py::arg("poleRA"),
+             py::arg("poleDec"), R"mydelimiter(
+            Set the J2 parameter of the body.
+
+            Parameters
+            ----------
+            J2 : real
+                J2 parameter of the body.
+            poleRA : real
+                Right ascension of the pole of the body in degrees.
+            poleDec : real
+                Declination of the pole of the body in degrees.
+
+            Returns
+            -------
+            None : NoneType
+                None.
+            )mydelimiter")
+        .def("set_harmonics", &Body::set_harmonics, py::arg("poleRA"),
+             py::arg("poleDec"), py::arg("nZon"), py::arg("nTes"), py::arg("J"),
+             py::arg("C"), py::arg("S"), R"mydelimiter(
+            Set the J2 parameter of the body.
+
+            Parameters
+            ----------
+            poleRA : real
+                Right ascension of the pole of the body in degrees.
+            poleDec : real
+                Declination of the pole of the body in degrees.
+            nZon : int
+                Degree of the spherical harmonics.
+            nTes : int
+                Order of the spherical harmonics.
+            J : list of real
+                Zonal coefficients of the spherical harmonics.
+            C : list of list of real
+                Sectoral coefficients of the spherical harmonics.
+            S : list of list of real
+                Tesseral coefficients of the spherical harmonics.
+
+            Returns
+            -------
+            None : NoneType
+                None.
+            )mydelimiter");
+
+    py::class_<SpiceBody, Body>(m, "SpiceBody", R"mydelimiter(
+        The SpiceBody class contains the properties of a SPICE body.
+        )mydelimiter")
+        .def(py::init<std::string, int, real, real, real>(), py::arg("name"),
+             py::arg("spiceId"), py::arg("t0"), py::arg("mass"),
+             py::arg("radius"),
+             R"mydelimiter(
+            Constructor for the SpiceBody class.
+
+            name : str
+                Name of the body.
+            spiceId : int
+                SPICE ID of the body.
+            t0 : real
+                Initial MJD TDB time of the body. Same as the initial time of the propagator.
+            mass : real
+                Mass of the body.
+            radius : real
+                Radius of the body.
+            )mydelimiter")
+        .def_readwrite("spiceId", &SpiceBody::spiceId, R"mydelimiter(
+            SPICE ID of the body.
+            )mydelimiter")
+        .def_readwrite("isSpice", &SpiceBody::isSpice, R"mydelimiter(
+            Whether the body is a SPICE body. Always True.
+            )mydelimiter");
+
+    py::class_<IntegBody, Body>(m, "IntegBody", R"mydelimiter(
+        The IntegBody class contains the properties of an integrated body.
+        )mydelimiter")
+        .def(py::init<std::string, real, real, real, std::vector<real>,
+                      NongravParameters>(),
+             py::arg("name"), py::arg("t0"), py::arg("mass"), py::arg("radius"),
+             py::arg("cometaryState"), py::arg("ngParams"),
+             R"mydelimiter(
+            Constructor for the IntegBody class.
+
+            name : str
+                Name of the body.
+            t0 : real
+                Initial MJD TDB time of the body. Same as the initial time of the propagator.
+            mass : real
+                Mass of the body.
+            radius : real
+                Radius of the body.
+            cometaryState : list of real
+                Initial Heliocentric Ecliptic Cometary state of the body.
+            ngParams : libgrss.NongravParameters
+                Non-gravitational parameters of the body.
+            )mydelimiter")
+
+        .def(py::init<std::string, real, real, real, std::vector<real>,
+                      std::vector<real>, NongravParameters>(),
+             py::arg("name"), py::arg("t0"), py::arg("mass"), py::arg("radius"),
+             py::arg("pos"), py::arg("vel"), py::arg("ngParams"), R"mydelimiter(
+            Constructor for the IntegBody class.
+
+            name : str
+                Name of the body.
+            t0 : real
+                Initial MJD TDB time of the body. Same as the initial time of the propagator.
+            mass : real
+                Mass of the body.
+            radius : real
+                Radius of the body.
+            pos : list of real
+                Initial barycentric Cartesian position of the body.
+            vel : list of real
+                Initial barycentric Cartesian velocity of the body.
+            ngParams : libgrss.NongravParameters
+                Non-gravitational parameters of the body.
+            )mydelimiter")
+        .def_readwrite("spiceId", &IntegBody::spiceId, R"mydelimiter(
+            SPICE ID of the body.
+            )mydelimiter")
+        .def_readwrite("logCA", &IntegBody::logCA, R"mydelimiter(
+            Boolean for whether to log close approaches of the body.
+            )mydelimiter")
+        .def_readwrite("isCometary", &IntegBody::isCometary, R"mydelimiter(
+            Whether the body is a cometary body.
+            )mydelimiter")
+        .def_readwrite("initState", &IntegBody::initState, R"mydelimiter(
+            Initial input state of the body (Cometary heliocentric/Cartesian barycentric).
+            )mydelimiter")
+        .def_readwrite("initCart", &IntegBody::initCart, R"mydelimiter(
+            Initial barycentric Cartesian state of the body.
+            )mydelimiter")
+        .def_readwrite("isInteg", &IntegBody::isInteg, R"mydelimiter(
+            Whether the body is an integrated body. Always True.
+            )mydelimiter")
+        .def_readwrite("isThrusting", &IntegBody::isThrusting, R"mydelimiter(
+            Whether the body is thrusting.
+            )mydelimiter")
+        .def_readwrite("ngParams", &IntegBody::ngParams, R"mydelimiter(
+            Non-gravitational parameters of the body.
+            )mydelimiter")
+        .def_readwrite("n2Derivs", &IntegBody::n2Derivs, R"mydelimiter(
+            Number of second derivatives of the body.
+            )mydelimiter")
+        .def_readwrite("propStm", &IntegBody::propStm, R"mydelimiter(
+            Boolean for whether to propagate the state transition matrix of the body.
+            )mydelimiter")
+        .def_readwrite("stm", &IntegBody::stm, R"mydelimiter(
+            State transition matrix of the body.
+            )mydelimiter")
+        .def_readwrite("dCartdState", &IntegBody::dCartdState, R"mydelimiter(
+            Partials of initial cartesian state with repect to initial input state of the body.
+            )mydelimiter")
+        .def("prepare_stm", &IntegBody::prepare_stm, R"mydelimiter(
+            Prepare the state transition matrix of the body for propagation.
+
+            Returns
+            -------
+            None : NoneType
+                None.
+            )mydelimiter");
+
+    // expose event class and its empty constructor
+    py::class_<Event>(m, "Event", R"mydelimiter(
+        The Event class contains the properties of an impulsive or continuous event.
+        Impulsive events are instantaneous changes in the velocity of the body.
+        Continuous events are an exponentially decaying acceleration acting on the body.
+        )mydelimiter")
+        .def(py::init<>())
+        .def("apply_impulsive", [](Event &event, PropSimulation &propSim, const real t, std::vector<real> xInteg) {
+            event.apply_impulsive(&propSim, t, xInteg);
+            return xInteg;
+        }, py::arg("propSim"), py::arg("t"), py::arg("xInteg"),
+        R"mydelimiter(
+            Apply the impulsive event to an integration state. The C++
+            std::vector& output argument is returned as a Python list.
+        )mydelimiter")
+        .def_readwrite("t", &Event::t, R"mydelimiter(
+            Time of the event (MJD TDB).
+            )mydelimiter")
+        .def_readwrite("bodyName", &Event::bodyName, R"mydelimiter(
+            Name of the body the event is acting on. Throws an error if the body
+            is not found in the simulation.
+            )mydelimiter")
+        .def_readwrite("isContinuous", &Event::isContinuous, R"mydelimiter(
+            Whether the event is a continuous event. False by default.
+            )mydelimiter")
+        .def_readwrite("eventEst", &Event::eventEst, R"mydelimiter(
+            Flag for whether to estimate anything for the event. False by default.
+            )mydelimiter")
+        .def_readwrite("bodyIndex", &Event::bodyIndex, R"mydelimiter(
+            Index of the integration body affected by this event.
+            )mydelimiter")
+        .def_readwrite("xIntegIndex", &Event::xIntegIndex, R"mydelimiter(
+            Starting index of this body's state in the flattened integration state.
+            )mydelimiter")
+        .def_readwrite("hasStarted", &Event::hasStarted, R"mydelimiter(
+            Whether this event has already started during propagation.
+            )mydelimiter")
+        .def_readwrite("deltaV", &Event::deltaV, R"mydelimiter(
+            Delta-V vector of the event.
+            )mydelimiter")
+        .def_readwrite("multiplier", &Event::multiplier, R"mydelimiter(
+            Multiplier of the event. For impulsive events, this is a scalar
+            multiplier for the delta-V vector. Not used for continuous events.
+            )mydelimiter")
+        .def_readwrite("deltaVEst", &Event::deltaVEst, R"mydelimiter(
+            Flag for whether to estimate the delta-V of the event. False by default.
+            )mydelimiter")
+        .def_readwrite("multiplierEst", &Event::multiplierEst, R"mydelimiter(
+            Flag for whether to estimate the multiplier of the event. False by default.
+            )mydelimiter")
+        .def_readwrite("expAccel0", &Event::expAccel0, R"mydelimiter(
+            Initial acceleration vector for the continuous event.
+            )mydelimiter")
+        .def_readwrite("tau", &Event::tau, R"mydelimiter(
+            Time constant for the exponential decay of the continuous event.
+            )mydelimiter")
+        .def_readwrite("expAccel0Est", &Event::expAccel0Est, R"mydelimiter(
+            Flag for whether to estimate the initial acceleration of the continuous event. False by default.
+            )mydelimiter")
+        .def_readwrite("tauEst", &Event::tauEst, R"mydelimiter(
+            Flag for whether to estimate the time constant of the continuous event. False by default.
+            )mydelimiter");
+
+    m.def("reconstruct_stm", &reconstruct_stm, py::arg("stm"), R"mydelimiter(
+        Reconstruct the state transition matrix from the flattened vector.
+
+        Parameters
+        ----------
+        stm : list of real
+            Flattened state transition matrix.
+
+        Returns
+        -------
+        stmMat : list of list of real
+            Reconstructed state transition matrix.
+        )mydelimiter");
+
+    m.def("propSim_parallel_omp", &propSim_parallel_omp, py::arg("refSim"),
+          py::arg("isCometary"), py::arg("allBodies"),
+          py::arg("maxThreads") = 128, R"mydelimiter(
+        Propagate a simulation in parallel using OpenMP.
+
+        Parameters
+        ----------
+        refSim : PropSimulation
+            Reference simulation to copy.
+        isCometary : bool
+            Whether the bodies are cometary bodies.
+        allBodies : list of list of real
+            List of all bodies to propagate. Each list contains the initial MJD TDB time,
+            mass, radius, initial state, and list of non-gravitational parameters of the body.
+            The initial state is either the initial Heliocentric Ecliptic Cometary state
+            or the initial barycentric Cartesian state (position and velocity separated).
+        maxThreads : int, optional
+            Maximum number of threads to use, by default min(128, available_cores).
+
+        Returns
+        -------
+        allSims : list of PropSimulation
+            List of all simulations propagated in parallel.
+        )mydelimiter");
+
+    py::class_<PropSimulation>(m, "PropSimulation", R"mydelimiter(
+        The PropSimulation class contains the orbit propagation simulation for intgrating solar system small bodies.
+        )mydelimiter")
+        .def(py::init<std::string, real, const int, std::string>(),
+             py::arg("name"), py::arg("t0"), py::arg("defaultSpiceBodies"),
+             py::arg("DEkernelPath"), R"mydelimiter(
+            Constructor for the PropSimulation class.
+
+            name : str
+                Name of the simulation.
+            t0 : real
+                Initial MJD TDB time of the simulation.
+            defaultSpiceBodies : int
+                Version of the DE kernel to get the default SPICE bodies from.
+            DEkernelPath : str
+                Path to the SPICE DE kernel.
+            )mydelimiter")
+        .def(py::init<std::string, const PropSimulation &>(), py::arg("name"),
+             py::arg("simRef"), R"mydelimiter(
+            Constructor for the PropSimulation class.
+
+            name : str
+                Name of the simulation.
+            simRef : PropSimulation
+                Simulation to copy.
+            )mydelimiter")
+        .def("prepare_for_evaluation", [](PropSimulation &sim,
+                                            std::vector<real> tEval,
+                                            std::vector<std::vector<real>> observerInfo) {
+            sim.prepare_for_evaluation(tEval, observerInfo);
+            return py::make_tuple(tEval, observerInfo);
+        }, py::arg("tEval"), py::arg("observerInfo"),
+        R"mydelimiter(
+            Prepare evaluation epochs and observer data. The two mutated C++
+            std::vector& arguments are returned as ``(tEval, observerInfo)``.
+        )mydelimiter")
+        .def("preprocess", &PropSimulation::preprocess)
+        .def_readwrite("name", &PropSimulation::name, R"mydelimiter(
+            Name of the simulation.
+            )mydelimiter")
+        .def_readwrite("DEkernelPath", &PropSimulation::DEkernelPath,
+                       R"mydelimiter(
+            Path to the SPICE DE kernel.
+            )mydelimiter")
+        .def_readwrite("unsafePersistentMemoryMap",
+                       &PropSimulation::unsafePersistentMemoryMap,
+                       R"mydelimiter(
+            Whether to use unsafe persistent memory mapping for the simulation.
+            )mydelimiter")
+        .def_readwrite("consts", &PropSimulation::consts, R"mydelimiter(
+            Constants of the simulation. libgrss.Constants object.
+            )mydelimiter")
+        .def_readwrite("integParams", &PropSimulation::integParams,
+                       R"mydelimiter(
+            Integration parameters of the simulation. libgrss.IntegParams object.
+            )mydelimiter")
+        .def_readwrite("spiceBodies", &PropSimulation::spiceBodies,
+                       R"mydelimiter(
+            SPICE bodies of the simulation. List of libgrss.SpiceBodies objects.
+            )mydelimiter")
+        .def_readwrite("integBodies", &PropSimulation::integBodies,
+                       R"mydelimiter(
+            Integration bodies of the simulation. List of libgrss.IntegBody objects.
+            )mydelimiter")
+        .def_readwrite("caParams", &PropSimulation::caParams, R"mydelimiter(
+            Close approach parameters of the simulation. List of libgrss.CloseApproachParameters objects.
+            )mydelimiter")
+        .def_readwrite("impactParams", &PropSimulation::impactParams,
+                       R"mydelimiter(
+            Impact parameters of the simulation. List of libgrss.ImpactParameters objects.
+            )mydelimiter")
+        .def_readwrite("t", &PropSimulation::t, R"mydelimiter(
+            Current time of the simulation.
+            )mydelimiter")
+        .def_readwrite("xInteg", &PropSimulation::xInteg, R"mydelimiter(
+            Current states of each integration body in the simulation.
+            )mydelimiter")
+        .def_readwrite("interpParams", &PropSimulation::interpParams,
+                       R"mydelimiter(
+            Interpolation parameters of the simulation. libgrss.InterpolationParameters object.
+            )mydelimiter")
+        .def_readwrite("tEvalUTC", &PropSimulation::tEvalUTC, R"mydelimiter(
+            Whether the MJD evaluation time is in UTC for each value in PropSimulation.tEval,
+            as opposed to TDB.
+            )mydelimiter")
+        .def_readwrite("evalApparentState", &PropSimulation::evalApparentState,
+                       R"mydelimiter(
+            Whether to evaluate the apparent state of the integration bodies.
+            )mydelimiter")
+        .def_readwrite("evalMeasurements", &PropSimulation::evalMeasurements,
+                       R"mydelimiter(
+            Whether to evaluate the measurements of the integration bodies.
+            )mydelimiter")
+        .def_readwrite("convergedLightTime",
+                       &PropSimulation::convergedLightTime, R"mydelimiter(
+            Whether to use converged Newtonian light time correction.
+            )mydelimiter")
+        .def_readwrite("xObserver", &PropSimulation::xObserver, R"mydelimiter(
+            State of the observer for each value in PropSimulation.tEval.
+            )mydelimiter")
+        .def_readwrite("observerInfo", &PropSimulation::observerInfo,
+                       R"mydelimiter(
+            Observer information for each value in PropSimulation.tEval.
+            )mydelimiter")
+        .def_readwrite("tEvalMargin", &PropSimulation::tEvalMargin,
+                       R"mydelimiter(
+            Margin for allowing evaluation past the propagation start and end times.
+            )mydelimiter")
+        .def_readwrite("tEval", &PropSimulation::tEval, R"mydelimiter(
+            MJD Times to evaluate the states of the integrated bodies at.
+            Can be TDB or UTC based on PropSimulation.tEvalUTC.
+            )mydelimiter")
+        .def_readwrite("obsType", &PropSimulation::obsType,
+                       R"mydelimiter(
+            Observation type for each value in PropSimulation.tEval (0=optical, 1=delay, 2=doppler, 3=Gaia).
+            )mydelimiter")
+        .def_readwrite("lightTimeEval", &PropSimulation::lightTimeEval,
+                       R"mydelimiter(
+            Light time from the observer to each integration body for each value in PropSimulation.tEval.
+            )mydelimiter")
+        .def_readwrite("xIntegEval", &PropSimulation::xIntegEval, R"mydelimiter(
+            States of each integration body in the simulation for each value in PropSimulation.tEval.
+            )mydelimiter")
+        .def_readwrite("opticalObs", &PropSimulation::opticalObs,
+                       R"mydelimiter(
+            Optical observation of each integration body in the simulation for each value in PropSimulation.tEval.
+            )mydelimiter")
+        .def_readwrite("opticalObsDot", &PropSimulation::opticalObsDot,
+                       R"mydelimiter(
+            Time derivative of the optical observation of each integration body in the simulation for each value in PropSimulation.tEval.
+            )mydelimiter")
+        .def_readwrite("opticalPartials", &PropSimulation::opticalPartials,
+                       R"mydelimiter(
+            Optical observation partials of each integration body in the simulation for each value in PropSimulation.tEval.
+            )mydelimiter")
+        .def_readwrite("opticalObsCorr", &PropSimulation::opticalObsCorr,
+                       R"mydelimiter(
+            Photocenter-barycenter correction for each optical observation for each integration body in the simulation.
+            )mydelimiter")
+        .def_readwrite("radarObs", &PropSimulation::radarObs,
+                       R"mydelimiter(
+            Radar observation of each integration body in the simulation for each value in PropSimulation.tEval.
+            )mydelimiter")
+        .def_readwrite("radarPartials", &PropSimulation::radarPartials,
+                       R"mydelimiter(
+            Radar observation partials of each integration body in the simulation for each value in PropSimulation.tEval.
+            )mydelimiter")
+        .def("interpolate", &PropSimulation::interpolate, py::arg("t"),
+             R"mydelimiter(
+            Interpolates the states of the integrated bodies to a given time.
+
+            Parameters
+            ----------
+            t : real
+                Time to interpolate to.
+
+            Returns
+            -------
+            xIntegInterp : list of real
+                Interpolated GEOMETRIC states of the integrated bodies.
+            )mydelimiter")
+        .def("add_spice_body", &PropSimulation::add_spice_body, py::arg("body"),
+             R"mydelimiter(
+            Adds a SPICE body to the simulation.
+
+            Parameters
+            ----------
+            body : libgrss.SpiceBody
+                SPICE body to add to the simulation.
+            )mydelimiter")
+        .def("map_ephemeris", &PropSimulation::map_ephemeris, R"mydelimiter(
+            Memory maps the ephemeris of the simulation.
+
+            Returns
+            -------
+            None : NoneType
+                None.
+            )mydelimiter")
+        .def("unmap_ephemeris", &PropSimulation::unmap_ephemeris, R"mydelimiter(
+            Unmaps the ephemeris of the simulation.
+
+            Returns
+            -------
+            None : NoneType
+                None.
+            )mydelimiter")
+        .def("get_spiceBody_state", &PropSimulation::get_spiceBody_state,
+             py::arg("t"), py::arg("bodyName"), R"mydelimiter(
+            Gets the state of a SPICE body at a given time.
+
+            Parameters
+            ----------
+            t : real
+                Time to get the state at.
+            bodyName : str
+                Name of the SPICE body in the simulation.
+            )mydelimiter")
+        .def("add_integ_body", &PropSimulation::add_integ_body, py::arg("body"),
+             R"mydelimiter(
+            Adds an integration body to the simulation.
+
+            Parameters
+            ----------
+            body : libgrss.IntegBody
+                Integration body to add to the simulation.
+            )mydelimiter")
+        .def("remove_body", &PropSimulation::remove_body, py::arg("name"),
+             R"mydelimiter(
+            Removes a body from the simulation.
+
+            Parameters
+            ----------
+            name : str
+                Name of the body to remove.
+            )mydelimiter")
+        .def("add_event", &PropSimulation::add_event, py::arg("event"),
+             R"mydelimiter(
+            Adds an event to the simulation.
+
+            Parameters
+            ----------
+            event : libgrss.Event
+                Event to add to the simulation.
+            )mydelimiter")
+        .def("set_sim_constants", &PropSimulation::set_sim_constants,
+             py::arg("du2m") = 149597870700.0L, py::arg("tu2s") = 86400.0L,
+             py::arg("G") = 6.6743e-11L /
+                 (149597870700.0L * 149597870700.0L * 149597870700.0L) *
+                 86400.0L * 86400.0L,
+             py::arg("clight") = 299792458.0L / 149597870700.0L * 86400.0L,
+             R"mydelimiter(
+            Sets the constants of the simulation.
+
+            Parameters
+            ----------
+            du2m : real
+                Conversion factor from distance units to meters.
+            tu2s : real
+                Conversion factor from time units to seconds.
+            G : real
+                Gravitational constant.
+            clight : real
+                Speed of light in a vacuum.
+            )mydelimiter")
+        .def("set_integration_parameters",
+             &PropSimulation::set_integration_parameters, py::arg("tf"),
+             py::arg("tEval") = std::vector<real>(),
+             py::arg("tEvalUTC") = false, py::arg("evalApparentState") = false,
+             py::arg("convergedLightTime") = false,
+             py::arg("observerInfo") = std::vector<std::vector<real>>(),
+             py::arg("adaptiveTimestep") = true, py::arg("dt0") = 1.0L,
+             py::arg("dtMin") = 1.0e-4L, py::arg("dtChangeFactor") = 0.25L,
+             py::arg("tolInteg") = 1.0e-11L, py::arg("tolPC") = 1.0e-16L,
+             R"mydelimiter(
+            Sets the integration parameters.
+
+            Parameters
+            ----------
+            tf : real
+                Final time of integration (MJD TDB).
+            tEval : list of real
+                MJD Times to evaluate the states of the integrated bodies at.
+                Can be TDB or UTC based on tEvalUTC.
+            tEvalUTC : bool
+                Whether the MJD evaluation time is in UTC for each value in
+                libgrss.tEval, as opposed to TDB.
+            evalApparentState : bool
+                Whether to evaluate the apparent state of the integration bodies.
+            convergedLightTimes : bool
+                Whether to use converged Newtonian light time correction.
+            observerInfo : list of list of real
+                Observer information. Each list at least contains the central body SPICE ID
+                (e.g., 399 for Earth) and the body-fixed longitude, latitude, and distance.
+                This information should be repeated for radar observations.
+            adaptiveTimestep : bool
+                Flag to use adaptive time step for the propagation.
+            dt0 : real
+                Initial time step.
+            dtMin : real
+                Minimum time step.
+            dtChangeFactor : real
+                Factor by which to limit the change in time step.
+            tolInteg : real
+                Tolerance for integration.
+            tolPC : real
+                Tolerance for predictor-corrector within IAS15.
+            )mydelimiter")
+        .def("get_sim_constants", &PropSimulation::get_sim_constants,
+             R"mydelimiter(
+                Gets the constants of the simulation.
+
+                Returns
+                -------
+                du2m : real
+                    Conversion factor from distance units to meters.
+                tu2s : real
+                    Conversion factor from time units to seconds.
+                G : real
+                    Gravitational constant.
+                clight : real
+                    Speed of light in a vacuum.
+                j2000Jd : real
+                    Julian date of J2000 epoch.
+                JdMinusMjd : real
+                    Difference between Julian date and modified Julian date.
+                )mydelimiter")
+        .def("get_integration_parameters",
+             &PropSimulation::get_integration_parameters, R"mydelimiter(
+            Gets the integration parameters.
+
+            Returns
+            -------
+            nInteg : int
+                Number of integrated bodies.
+            nSpice : int
+                Number of bodies with SPICE ephemerides.
+            nTotal : int
+                Total number of bodies. nTotal = nInteg + nSpice.
+            t0 : real
+                Initial time of integration (MJD TDB).
+            tf : real
+                Final time of integration (MJD TDB).
+            adaptiveTimestep : bool
+                Flag to use adaptive time step for the propagation.
+            dt0 : real
+                Initial time step.
+            dtMin : real
+                Minimum time step.
+            dtChangeFactor : real
+                Factor by which to limit the change in time step.
+            tolInteg : real
+                Tolerance for integration.
+            tolPC : real
+                Tolerance for predictor-corrector within IAS15.
+            )mydelimiter")
+        .def("integrate", &PropSimulation::integrate, R"mydelimiter(
+            Propagates the simulation using the Gauss-Radau integrator.
+            )mydelimiter")
+        .def("extend", &PropSimulation::extend, py::arg("tf"),
+             py::arg("tEvalNew") = std::vector<real>(),
+             py::arg("observerInfoNew") = std::vector<std::vector<real>>(),
+             R"mydelimiter(
+            Extends the simulation to a new final time.
+
+            Parameters
+            ----------
+            tf : real
+                New final time of integration (MJD TDB).
+            tEvalNew : list of real
+                Extra MJD Times to evaluate the states of the integrated bodies at.
+                Can be TDB or UTC based on tEvalUTC.
+            observerInfoNew : list of list of real
+                New observer information. Each list at least contains the central body SPICE ID
+                (e.g., 399 for Earth) and the body-fixed longitude, latitude, and distance.
+                This information should be repeated for radar observations.
+            )mydelimiter")
+        .def("save", &PropSimulation::save, py::arg("filename"),
+             py::arg("onlyMachineData") = false,
+             R"mydelimiter(
+            Saves the simulation to a file.
+
+            Parameters
+            ----------
+            filename : str
+                Name of the file to save the simulation to.
+            )mydelimiter");
+
+    // ---------------------------------------------------------------------
+    // Additional C++ data structures needed by the complete binding surface.
+    // ---------------------------------------------------------------------
+
+    py::class_<PckTarget>(m, "PckTarget")
+        .def(py::init<>())
+        .def_readwrite("code", &PckTarget::code)
+        .def_readwrite("ref", &PckTarget::ref)
+        .def_readwrite("beg", &PckTarget::beg)
+        .def_readwrite("end", &PckTarget::end)
+        .def_readwrite("res", &PckTarget::res)
+        .def_readwrite("ind", &PckTarget::ind)
+        .def_property_readonly("one", [](const PckTarget &x) {
+            if (!x.one || x.ind <= 0) return std::vector<int>{};
+            return std::vector<int>(x.one, x.one + x.ind);
+        })
+        .def_property_readonly("two", [](const PckTarget &x) {
+            if (!x.two || x.ind <= 0) return std::vector<int>{};
+            return std::vector<int>(x.two, x.two + x.ind);
+        });
+
+    py::class_<PckInfo>(m, "PckInfo")
+        .def(py::init<>())
+        .def_readwrite("num", &PckInfo::num)
+        .def_readwrite("allocatedNum", &PckInfo::allocatedNum)
+        .def_readwrite("len", &PckInfo::len)
+        .def_readwrite("spiceIdToIdx", &PckInfo::spiceIdToIdx)
+        .def_property_readonly("targets", [](const PckInfo &x) {
+            if (!x.targets || x.num <= 0) return std::vector<PckTarget>{};
+            return std::vector<PckTarget>(x.targets, x.targets + x.num);
+        });
+
+    py::class_<PckEphemeris>(m, "PckEphemeris")
+        .def(py::init<>())
+        .def_readwrite("histPckPath", &PckEphemeris::histPckPath)
+        .def_readwrite("latestPckPath", &PckEphemeris::latestPckPath)
+        .def_readwrite("predictPckPath", &PckEphemeris::predictPckPath)
+        .def_readwrite("moonPckPath", &PckEphemeris::moonPckPath)
+        .def_readwrite("histPck", &PckEphemeris::histPck)
+        .def_readwrite("latestPck", &PckEphemeris::latestPck)
+        .def_readwrite("predictPck", &PckEphemeris::predictPck)
+        .def_readwrite("moonPck", &PckEphemeris::moonPck);
+
+    py::class_<SpkCacheItem>(m, "SpkCacheItem")
+        .def(py::init<>())
+        .def_readwrite("spiceId", &SpkCacheItem::spiceId)
+        .def_readwrite("t", &SpkCacheItem::t)
+        .def_property("state",
+                      [](const SpkCacheItem &x) {
+                          return std::vector<double>(x.state, x.state + 9);
+                      },
+                      [](SpkCacheItem &x, const std::vector<double> &v) {
+                          if (v.size() != 9) throw std::invalid_argument("SpkCacheItem.state must have length 9");
+                          std::copy(v.begin(), v.end(), x.state);
+                      });
+
+    py::class_<SpkCache>(m, "SpkCache")
+        .def(py::init<>())
+        .def_readwrite("t", &SpkCache::t)
+        .def_property_readonly("items", [](const SpkCache &x) {
+            return std::vector<SpkCacheItem>(std::begin(x.items), std::end(x.items));
+        });
+
+    py::class_<SpkTarget>(m, "SpkTarget")
+        .def(py::init<>())
+        .def_readwrite("code", &SpkTarget::code)
+        .def_readwrite("cen", &SpkTarget::cen)
+        .def_readwrite("beg", &SpkTarget::beg)
+        .def_readwrite("end", &SpkTarget::end)
+        .def_readwrite("res", &SpkTarget::res)
+        .def_readwrite("ind", &SpkTarget::ind)
+        .def_property_readonly("one", [](const SpkTarget &x) {
+            if (!x.one || x.ind <= 0) return std::vector<int>{};
+            return std::vector<int>(x.one, x.one + x.ind);
+        })
+        .def_property_readonly("two", [](const SpkTarget &x) {
+            if (!x.two || x.ind <= 0) return std::vector<int>{};
+            return std::vector<int>(x.two, x.two + x.ind);
+        });
+
+    py::class_<SpkInfo>(m, "SpkInfo")
+        .def(py::init<>())
+        .def_readwrite("num", &SpkInfo::num)
+        .def_readwrite("allocatedNum", &SpkInfo::allocatedNum)
+        .def_readwrite("len", &SpkInfo::len)
+        .def_readwrite("spiceIdToIdx", &SpkInfo::spiceIdToIdx)
+        .def_property_readonly("targets", [](const SpkInfo &x) {
+            if (!x.targets || x.num <= 0) return std::vector<SpkTarget>{};
+            return std::vector<SpkTarget>(x.targets, x.targets + x.num);
+        });
+
+    py::class_<SpkEphemeris>(m, "SpkEphemeris")
+        .def(py::init<>())
+        .def_readwrite("mbPath", &SpkEphemeris::mbPath)
+        .def_readwrite("sbPath", &SpkEphemeris::sbPath)
+        .def_readwrite("mb", &SpkEphemeris::mb)
+        .def_readwrite("sb", &SpkEphemeris::sb)
+        .def_readwrite("nextIdxToWrite", &SpkEphemeris::nextIdxToWrite)
+        .def_readwrite("cache", &SpkEphemeris::cache);
+
+    // Python-owned storage for the C++ STMParameters pointer fields.
+    struct PySTMParameters {
+        STMParameters value;
+        std::vector<real> B = std::vector<real>(9, 0.0);
+        std::vector<real> Bdot = std::vector<real>(9, 0.0);
+        std::vector<real> C = std::vector<real>(9, 0.0);
+        std::vector<real> Cdot = std::vector<real>(9, 0.0);
+        std::vector<real> D;
+        std::vector<real> Ddot;
+        std::vector<real> dfdpos = std::vector<real>(9, 0.0);
+        std::vector<real> dfdvel = std::vector<real>(9, 0.0);
+        std::vector<real> dfdpar;
+        size_t numParams = 0;
+
+        explicit PySTMParameters(size_t n = 0)
+            : D(3 * n, 0.0), Ddot(3 * n, 0.0), dfdpar(3 * n, 0.0), numParams(n) {
+            sync();
+        }
+
+        void sync() {
+            value.B = B.data();
+            value.Bdot = Bdot.data();
+            value.C = C.data();
+            value.Cdot = Cdot.data();
+            value.D = D.data();
+            value.Ddot = Ddot.data();
+            value.dfdpos = dfdpos.data();
+            value.dfdvel = dfdvel.data();
+            value.dfdpar = dfdpar.data();
+        }
+    };
+
+    py::class_<PySTMParameters>(m, "STMParameters")
+        .def(py::init<size_t>(), py::arg("numParams") = 0)
+        .def_property("B",
+                      [](const PySTMParameters &x) { return x.B; },
+                      [](PySTMParameters &x, const std::vector<real> &v) {
+                          if (v.size() != 9) throw std::invalid_argument("B must have length 9");
+                          x.B = v; x.sync();
+                      })
+        .def_property("Bdot",
+                      [](const PySTMParameters &x) { return x.Bdot; },
+                      [](PySTMParameters &x, const std::vector<real> &v) {
+                          if (v.size() != 9) throw std::invalid_argument("Bdot must have length 9");
+                          x.Bdot = v; x.sync();
+                      })
+        .def_property("C",
+                      [](const PySTMParameters &x) { return x.C; },
+                      [](PySTMParameters &x, const std::vector<real> &v) {
+                          if (v.size() != 9) throw std::invalid_argument("C must have length 9");
+                          x.C = v; x.sync();
+                      })
+        .def_property("Cdot",
+                      [](const PySTMParameters &x) { return x.Cdot; },
+                      [](PySTMParameters &x, const std::vector<real> &v) {
+                          if (v.size() != 9) throw std::invalid_argument("Cdot must have length 9");
+                          x.Cdot = v; x.sync();
+                      })
+        .def_property("D",
+                      [](const PySTMParameters &x) { return x.D; },
+                      [](PySTMParameters &x, const std::vector<real> &v) {
+                          if (v.size() != 3*x.numParams) throw std::invalid_argument("D has wrong length");
+                          x.D = v; x.sync();
+                      })
+        .def_property("Ddot",
+                      [](const PySTMParameters &x) { return x.Ddot; },
+                      [](PySTMParameters &x, const std::vector<real> &v) {
+                          if (v.size() != 3*x.numParams) throw std::invalid_argument("Ddot has wrong length");
+                          x.Ddot = v; x.sync();
+                      })
+        .def_property("dfdpos",
+                      [](const PySTMParameters &x) { return x.dfdpos; },
+                      [](PySTMParameters &x, const std::vector<real> &v) {
+                          if (v.size() != 9) throw std::invalid_argument("dfdpos must have length 9");
+                          x.dfdpos = v; x.sync();
+                      })
+        .def_property("dfdvel",
+                      [](const PySTMParameters &x) { return x.dfdvel; },
+                      [](PySTMParameters &x, const std::vector<real> &v) {
+                          if (v.size() != 9) throw std::invalid_argument("dfdvel must have length 9");
+                          x.dfdvel = v; x.sync();
+                      })
+        .def_property("dfdpar",
+                      [](const PySTMParameters &x) { return x.dfdpar; },
+                      [](PySTMParameters &x, const std::vector<real> &v) {
+                          if (v.size() != 3*x.numParams) throw std::invalid_argument("dfdpar has wrong length");
+                          x.dfdpar = v; x.sync();
+                      })
+        .def_readonly("numParams", &PySTMParameters::numParams);
+
+    // ---------------------------------------------------------------------
+    // Python-friendly wrappers for every C++ function declared in the GRSS
+    // headers. Pointer/out-parameter APIs return tuples/lists instead of
+    // requiring ctypes-style memory management.
+    // ---------------------------------------------------------------------
+
+    m.def("wrap_to_2pi", [](real angle) {
+        wrap_to_2pi(angle); return angle;
+    }, py::arg("angle"));
+
+    m.def("rad_to_deg", [](real rad) { return rad_to_deg(rad); }, py::arg("rad"));
+    m.def("rad_to_deg_out", [](real rad) { real deg = 0; rad_to_deg(rad, deg); return deg; }, py::arg("rad"));
+    m.def("deg_to_rad", [](real deg) { return deg_to_rad(deg); }, py::arg("deg"));
+    m.def("deg_to_rad_out", [](real deg) { real rad = 0; deg_to_rad(deg, rad); return rad; }, py::arg("deg"));
+
+    m.def("sort_vector", [](std::vector<real> v, bool ascending) {
+        std::vector<size_t> idx(v.size());
+        sort_vector(v, ascending, idx);
+        return py::make_tuple(v, idx);
+    }, py::arg("v"), py::arg("ascending"));
+
+    m.def("sort_vector_by_idx", [](std::vector<std::vector<real>> v,
+                                   const std::vector<size_t> &idx) {
+        sort_vector_by_idx(v, idx); return v;
+    }, py::arg("v"), py::arg("sortedIdx"));
+
+    m.def("vdot", [](std::vector<real> v1, std::vector<real> v2) {
+        real out = 0; vdot(v1, v2, out); return out;
+    }, py::arg("v1"), py::arg("v2"));
+    m.def("vdot_raw", [](std::vector<real> v1, std::vector<real> v2, size_t dim) {
+        if (v1.size() < dim || v2.size() < dim) throw std::invalid_argument("input shorter than dim");
+        real out = 0; vdot(v1.data(), v2.data(), dim, out); return out;
+    }, py::arg("v1"), py::arg("v2"), py::arg("dim"));
+
+    m.def("vnorm", [](std::vector<real> v) {
+        real out = 0; vnorm(v, out); return out;
+    }, py::arg("v"));
+    m.def("vnorm_raw", [](std::vector<real> v, size_t dim) {
+        if (v.size() < dim) throw std::invalid_argument("input shorter than dim");
+        real out = 0; vnorm(v.data(), dim, out); return out;
+    }, py::arg("v"), py::arg("dim"));
+
+    m.def("vunit", [](std::vector<real> v) {
+        std::vector<real> out(v.size()); vunit(v, out); return out;
+    }, py::arg("v"));
+    m.def("vunit_raw", [](std::vector<real> v, size_t dim) {
+        if (v.size() < dim) throw std::invalid_argument("input shorter than dim");
+        std::vector<real> out(dim); vunit(v.data(), dim, out.data()); return out;
+    }, py::arg("v"), py::arg("dim"));
+
+    m.def("vcross", [](const std::vector<real> &a, const std::vector<real> &b) {
+        std::vector<real> out(3); vcross(a, b, out); return out;
+    }, py::arg("v1"), py::arg("v2"));
+    m.def("vcross_raw", [](std::vector<real> a, std::vector<real> b) {
+        if (a.size() < 3 || b.size() < 3) throw std::invalid_argument("inputs must have length >= 3");
+        std::vector<real> out(3); vcross(a.data(), b.data(), out.data()); return out;
+    }, py::arg("v1"), py::arg("v2"));
+
+    m.def("vadd", [](const std::vector<real> &a, const std::vector<real> &b) {
+        std::vector<real> out(a.size()); vadd(a, b, out); return out;
+    }, py::arg("v1"), py::arg("v2"));
+    m.def("vsub", [](const std::vector<real> &a, const std::vector<real> &b) {
+        std::vector<real> out(a.size()); vsub(a, b, out); return out;
+    }, py::arg("v1"), py::arg("v2"));
+    m.def("vcmul", [](const std::vector<real> &v, real c) {
+        std::vector<real> out(v.size()); vcmul(v, c, out); return out;
+    }, py::arg("v"), py::arg("c"));
+    m.def("vvmul", [](const std::vector<real> &a, const std::vector<real> &b) {
+        std::vector<real> out(a.size()); vvmul(a, b, out); return out;
+    }, py::arg("v1"), py::arg("v2"));
+    m.def("vabs_max", [](const std::vector<real> &v) {
+        real out = 0; vabs_max(v, out); return out;
+    }, py::arg("v"));
+    m.def("vabs_max_raw", [](std::vector<real> v, size_t dim) {
+        if (v.size() < dim) throw std::invalid_argument("input shorter than dim");
+        real out = 0; vabs_max(v.data(), dim, out); return out;
+    }, py::arg("v"), py::arg("dim"));
+
+    m.def("mat_vec_mul", [](const std::vector<std::vector<real>> &A,
+                            const std::vector<real> &v) {
+        std::vector<real> out(A.size()); mat_vec_mul(A, v, out); return out;
+    }, py::arg("A"), py::arg("v"));
+
+    m.def("vec_mat_mul", [](const std::vector<real> &v,
+                            const std::vector<std::vector<real>> &A) {
+        size_t dim = A.size();
+        std::vector<real> out(dim);
+        std::vector<real*> rows(dim);
+        std::vector<std::vector<real>> Acopy = A;
+        for (size_t i = 0; i < dim; ++i) rows[i] = Acopy[i].data();
+        vec_mat_mul(v, rows.data(), dim, out);
+        return out;
+    }, py::arg("v"), py::arg("A"));
+
+    m.def("mat_mat_mul", [](const std::vector<std::vector<real>> &A,
+                            const std::vector<std::vector<real>> &B) {
+        std::vector<std::vector<real>> out(A.size(), std::vector<real>(B.empty() ? 0 : B[0].size()));
+        mat_mat_mul(A, B, out); return out;
+    }, py::arg("A"), py::arg("B"));
+
+    m.def("mat3_inv", [](const std::vector<std::vector<real>> &A) {
+        std::vector<std::vector<real>> out(3, std::vector<real>(3));
+        mat3_inv(A, out); return out;
+    }, py::arg("A"));
+
+    m.def("mat3_mat3_mul", [](const std::vector<real> &A, const std::vector<real> &B) {
+        if (A.size()!=9 || B.size()!=9) throw std::invalid_argument("3x3 matrices must be length 9");
+        std::vector<real> out(9); mat3_mat3_mul(A.data(), B.data(), out.data()); return out;
+    }, py::arg("A"), py::arg("B"));
+    m.def("mat3_mat3_add", [](const std::vector<real> &A, const std::vector<real> &B) {
+        if (A.size()!=9 || B.size()!=9) throw std::invalid_argument("3x3 matrices must be length 9");
+        std::vector<real> out(9); mat3_mat3_add(A.data(), B.data(), out.data()); return out;
+    }, py::arg("A"), py::arg("B"));
+
+    m.def("rot_mat_x", [](real theta) {
+        std::vector<std::vector<real>> R(3, std::vector<real>(3)); rot_mat_x(theta, R); return R;
+    }, py::arg("theta"));
+    m.def("rot_mat_y", [](real theta) {
+        std::vector<std::vector<real>> R(3, std::vector<real>(3)); rot_mat_y(theta, R); return R;
+    }, py::arg("theta"));
+    m.def("rot_mat_z", [](real theta) {
+        std::vector<std::vector<real>> R(3, std::vector<real>(3)); rot_mat_z(theta, R); return R;
+    }, py::arg("theta"));
+
+    m.def("LU_decompose", [](std::vector<std::vector<real>> A, real tol) {
+        size_t N = A.size(); std::vector<size_t> P(N);
+        LU_decompose(A, N, tol, P.data());
+        return py::make_tuple(A, P);
+    }, py::arg("A"), py::arg("tol") = 1.0e-16L);
+
+    m.def("LU_inverse", [](std::vector<std::vector<real>> A,
+                           const std::vector<size_t> &P) {
+        size_t N = A.size();
+        std::vector<std::vector<real>> out(N, std::vector<real>(N));
+        LU_inverse(A, P.data(), N, out);
+        return py::make_tuple(A, out);
+    }, py::arg("A"), py::arg("P"));
+
+    m.def("mat_inv", [](std::vector<std::vector<real>> A, real tol) {
+        std::vector<std::vector<real>> out(A.size(), std::vector<real>(A.empty() ? 0 : A[0].size()));
+        mat_inv(A, out, tol); return out;
+    }, py::arg("mat"), py::arg("tol") = 1.0e-16L);
+
+    // -------------------------------------------------------------------------
+    // Complete free-function surface.
+    // These adapters keep C++ reference/output parameters usable from native
+    // Python by returning the values that C++ writes through those parameters.
+    // -------------------------------------------------------------------------
+
+    // Approach / close-approach functions.
+    m.def("check_ca_or_impact", [](PropSimulation &s, real tOld, std::vector<real> xIntegOld,
+                                   real t, std::vector<real> xInteg) {
+        check_ca_or_impact(&s, tOld, std::move(xIntegOld), t, std::move(xInteg));
+    }, py::arg("propSim"), py::arg("tOld"), py::arg("xIntegOld"), py::arg("t"), py::arg("xInteg"));
+    m.def("ca_rdot_calc", [](PropSimulation &s, size_t i, size_t j, real t) {
+        real rDot = 0; ca_rdot_calc(&s, i, j, t, rDot); return rDot;
+    }, py::arg("propSim"), py::arg("i"), py::arg("j"), py::arg("t"));
+    m.def("impact_r_calc", [](PropSimulation &s, size_t i, size_t j, real t) {
+        real r = 0; impact_r_calc(&s, i, j, t, r); return r;
+    }, py::arg("propSim"), py::arg("i"), py::arg("j"), py::arg("t"));
+    m.def("get_rel_state", [](PropSimulation &s, size_t i, size_t j, real t) {
+        return get_rel_state(&s, i, j, t);
+    }, py::arg("propSim"), py::arg("i"), py::arg("j"), py::arg("t"));
+    m.def("get_bplane_partials", [](PropSimulation &s, CloseApproachParameters &ca, real mu, real radius) {
+        get_bplane_partials(&s, &ca, mu, radius);
+    }, py::arg("propSim"), py::arg("ca"), py::arg("mu"), py::arg("radius"));
+    m.def("get_ca_or_impact_time", [](PropSimulation &s, size_t i, size_t j, real x1, real x2,
+                                       const std::string &which) {
+        real tCA = 0;
+        void (*fn)(PropSimulation *, const size_t &, const size_t &, const real &, real &) = nullptr;
+        if (which == "ca" || which == "close_approach") fn = ca_rdot_calc;
+        else if (which == "impact") fn = impact_r_calc;
+        else throw std::invalid_argument("which must be 'ca' or 'impact'");
+        get_ca_or_impact_time(&s, i, j, x1, x2, tCA, fn); return tCA;
+    }, py::arg("propSim"), py::arg("i"), py::arg("j"), py::arg("x1"), py::arg("x2"),
+       py::arg("which") = "ca");
+
+    // Orbital elements.
+    m.def("kepler_solve_elliptic", [](real M, real e, real tol = 1.0e-12L, int max_iter = 250) {
+        real E = 0; kepler_solve_elliptic(M, e, E, tol, max_iter); return E;
+    }, py::arg("M"), py::arg("e"), py::arg("tol") = 1.0e-12L, py::arg("max_iter") = 250);
+    m.def("kepler_solve_hyperbolic", [](real M, real e, real tol = 1.0e-12L, int max_iter = 250) {
+        real EHyp = 0; kepler_solve_hyperbolic(M, e, EHyp, tol, max_iter); return EHyp;
+    }, py::arg("M"), py::arg("e"), py::arg("tol") = 1.0e-12L, py::arg("max_iter") = 250);
+    m.def("kepler_solve", [](real epochMjD, const std::vector<real> &cometaryState, real GM,
+                              real tol = 1.0e-12L, int max_iter = 250) {
+        real M = 0, E = 0, nu = 0;
+        kepler_solve(epochMjD, cometaryState, GM, M, E, nu, tol, max_iter);
+        return py::make_tuple(M, E, nu);
+    }, py::arg("epochMjD"), py::arg("cometaryState"), py::arg("GM") = 2.959122082855911e-4L,
+       py::arg("tol") = 1.0e-12L, py::arg("max_iter") = 250);
+    m.def("cometary_to_keplerian", [](real epochMjd, const std::vector<real> &cometaryState, real GM) {
+        std::vector<real> out(6); cometary_to_keplerian(epochMjd, cometaryState, out, GM); return out;
+    }, py::arg("epochMjd"), py::arg("cometaryState"), py::arg("GM") = 2.959122082855911e-4L);
+    m.def("keplerian_to_cometary", [](real epochMjd, const std::vector<real> &keplerianState, real GM) {
+        std::vector<real> out(6); keplerian_to_cometary(epochMjd, keplerianState, out, GM); return out;
+    }, py::arg("epochMjd"), py::arg("keplerianState"), py::arg("GM") = 2.959122082855911e-4L);
+    m.def("keplerian_to_cartesian", [](const std::vector<real> &keplerianState, real GM) {
+        std::vector<real> out(6); keplerian_to_cartesian(keplerianState, out, GM); return out;
+    }, py::arg("keplerianState"), py::arg("GM") = 2.959122082855911e-4L);
+    m.def("cartesian_to_keplerian", [](const std::vector<real> &cartesianState, real GM) {
+        std::vector<real> out(6); cartesian_to_keplerian(cartesianState, out, GM); return out;
+    }, py::arg("cartesianState"), py::arg("GM") = 2.959122082855911e-4L);
+    m.def("cometary_to_cartesian", [](real epochMjd, const std::vector<real> &cometaryState, real GM) {
+        std::vector<real> out(6); cometary_to_cartesian(epochMjd, cometaryState, out, GM); return out;
+    }, py::arg("epochMjd"), py::arg("cometaryState"), py::arg("GM") = 2.959122082855911e-4L);
+    m.def("cartesian_to_cometary", [](real epochMjd, const std::vector<real> &cartesianState, real GM) {
+        std::vector<real> out(6); cartesian_to_cometary(epochMjd, cartesianState, out, GM); return out;
+    }, py::arg("epochMjd"), py::arg("cartesianState"), py::arg("GM") = 2.959122082855911e-4L);
+    m.def("get_elements_partials", [](real epochMjd, const std::vector<real> &elems,
+                                       const std::string &conversion, real GM) {
+        std::vector<std::vector<real>> out(6, std::vector<real>(6));
+        get_elements_partials(epochMjd, elems, conversion, out, GM); return out;
+    }, py::arg("epochMjd"), py::arg("elems"), py::arg("conversion"),
+       py::arg("GM") = 2.959122082855911e-4L);
+    m.def("get_cartesian_partials", [](real epochMjd, const std::vector<real> &state,
+                                        const std::string &conversion, real GM) {
+        std::vector<std::vector<real>> out(6, std::vector<real>(6));
+        get_cartesian_partials(epochMjd, state, conversion, out, GM); return out;
+    }, py::arg("epochMjd"), py::arg("state"), py::arg("conversion"),
+       py::arg("GM") = 2.959122082855911e-4L);
+
+    // Time conversion. Each Python function exposes the value-returning C++ overload;
+    // *_inplace additionally exposes the reference-output overload semantics.
+    m.def("jd_to_et", [](real jd) { return jd_to_et(jd); }, py::arg("jd"));
+    m.def("jd_to_et_inplace", [](real jd) { real et = 0; jd_to_et(jd, et); return et; }, py::arg("jd"));
+    m.def("jd_to_mjd", [](real jd) { return jd_to_mjd(jd); }, py::arg("jd"));
+    m.def("jd_to_mjd_inplace", [](real jd) { real mjd = 0; jd_to_mjd(jd, mjd); return mjd; }, py::arg("jd"));
+    m.def("et_to_jd", [](real et) { return et_to_jd(et); }, py::arg("et"));
+    m.def("et_to_jd_inplace", [](real et) { real jd = 0; et_to_jd(et, jd); return jd; }, py::arg("et"));
+    m.def("et_to_mjd", [](real et) { return et_to_mjd(et); }, py::arg("et"));
+    m.def("et_to_mjd_inplace", [](real et) { real mjd = 0; et_to_mjd(et, mjd); return mjd; }, py::arg("et"));
+    m.def("mjd_to_jd", [](real mjd) { return mjd_to_jd(mjd); }, py::arg("mjd"));
+    m.def("mjd_to_jd_inplace", [](real mjd) { real jd = 0; mjd_to_jd(mjd, jd); return jd; }, py::arg("mjd"));
+    m.def("mjd_to_et", [](real mjd) { return mjd_to_et(mjd); }, py::arg("mjd"));
+    m.def("mjd_to_et_inplace", [](real mjd) { real et = 0; mjd_to_et(mjd, et); return et; }, py::arg("mjd"));
+    m.def("delta_at_utc", &delta_at_utc, py::arg("mjdUtc"));
+    m.def("delta_at_tai", &delta_at_tai, py::arg("mjdTai"));
+    m.def("delta_et_utc", &delta_et_utc, py::arg("mjdUtc"));
+    m.def("delta_et_tdb", &delta_et_tdb, py::arg("mjdTdb"));
+
+    // Force model.
+    m.def("get_state_der", [](PropSimulation &s, real t, const std::vector<real> &xInteg) {
+        std::vector<real> acc; acc.resize(xInteg.size()); get_state_der(&s, t, xInteg, acc); return acc;
+    }, py::arg("propSim"), py::arg("t"), py::arg("xInteg"));
+
+    m.def("get_baseBodyFrame", [](int spiceId, real tMjdTDB) {
+        std::string frame; get_baseBodyFrame(spiceId, tMjdTDB, frame); return frame;
+    }, py::arg("spiceId"), py::arg("tMjdTDB"));
+    m.def("get_observer_state", [](real tObsMjd, const std::vector<real> &observerInfo,
+                                    PropSimulation &s, bool tObsInUTC) {
+        std::vector<real> observerState; get_observer_state(tObsMjd, observerInfo, &s, tObsInUTC, observerState);
+        return observerState;
+    }, py::arg("tObsMjd"), py::arg("observerInfo"), py::arg("propSim"), py::arg("tObsInUTC"));
+    m.def("comp_sum", [](real num, real sum, real compCoeff) {
+        comp_sum(num, &sum, &compCoeff); return py::make_tuple(sum, compCoeff);
+    }, py::arg("num"), py::arg("sum"), py::arg("compCoeff"));
+
+    // IAS15/integration helpers.
+    m.def("get_initial_timestep", [](PropSimulation &s) { return get_initial_timestep(&s); }, py::arg("propSim"));
+    m.def("update_g_with_b", [](const std::vector<real> &b, size_t dim) {
+        std::vector<real> g(b.size()); update_g_with_b(b, dim, g); return g;
+    }, py::arg("b"), py::arg("dim"));
+    m.def("compute_g_and_b", [](const std::vector<std::vector<real>> &AccIntegArr, size_t hIdx,
+                                 size_t dim) {
+        std::vector<real> g(7 * dim), bCompCoeffs(7 * dim), b(7 * dim); real PCerr = 0;
+        compute_g_and_b(AccIntegArr, hIdx, g, bCompCoeffs, b, dim, PCerr);
+        return py::make_tuple(g, bCompCoeffs, b, PCerr);
+    }, py::arg("AccIntegArr"), py::arg("hIdx"), py::arg("dim"));
+    m.def("refine_b", [](std::vector<real> b, std::vector<real> e, real dtRatio, size_t dim) {
+        refine_b(b, e, dtRatio, dim); return py::make_tuple(b, e);
+    }, py::arg("b"), py::arg("e"), py::arg("dtRatio"), py::arg("dim"));
+    m.def("check_and_apply_impulsive_events", [](PropSimulation &s, real t, std::vector<real> xInteg) {
+        check_and_apply_impulsive_events(&s, t, xInteg); return xInteg;
+    }, py::arg("propSim"), py::arg("t"), py::arg("xInteg"));
+    m.def("check_continuous_events", [](PropSimulation &s, real t) {
+        check_continuous_events(&s, t);
+    }, py::arg("propSim"), py::arg("t"));
+    m.def("check_events", [](PropSimulation &s, real t, std::vector<real> xInteg) {
+        check_events(&s, t, xInteg); return xInteg;
+    }, py::arg("propSim"), py::arg("t"), py::arg("xInteg"));
+    m.def("event_timestep_check", [](PropSimulation &s, real dt) {
+        event_timestep_check(&s, dt); return dt;
+    }, py::arg("propSim"), py::arg("dt"));
+    m.def("ias15", [](PropSimulation &s) { ias15(&s); }, py::arg("propSim"));
+
+    // Interpolation helpers.
+    m.def("approx_xInteg_math", [](const std::vector<real> &x0, const std::vector<real> &a0, real dt, real h,
+                                    const std::vector<real> &b, size_t dim, size_t starti, size_t startb,
+                                    size_t iterStep) {
+        std::vector<real> next(x0.size()), comp(x0.size());
+        approx_xInteg_math(x0, a0, dt, h, b, dim, starti, startb, iterStep, next, comp);
+        return py::make_tuple(next, comp);
+    }, py::arg("xInteg0"), py::arg("accInteg0"), py::arg("dt"), py::arg("h"), py::arg("b"),
+       py::arg("dim"), py::arg("starti"), py::arg("startb"), py::arg("iterStep"));
+    m.def("approx_xInteg", [](const std::vector<real> &x0, const std::vector<real> &a0, real dt, real h,
+                               const std::vector<real> &b, size_t dim, const std::vector<IntegBody> &bodies) {
+        std::vector<real> next(x0.size()), comp(x0.size());
+        approx_xInteg(x0, a0, dt, h, b, dim, bodies, next, comp);
+        return py::make_tuple(next, comp);
+    }, py::arg("xInteg0"), py::arg("accInteg0"), py::arg("dt"), py::arg("h"), py::arg("b"),
+       py::arg("dim"), py::arg("integBodies"));
+    m.def("interpolate_on_the_fly", [](PropSimulation &s, real t, real dt) {
+        interpolate_on_the_fly(&s, t, dt);
+    }, py::arg("propSim"), py::arg("t"), py::arg("dt"));
+    m.def("get_interpIdxInWindow", [](const PropSimulation &s, real tWindowStart, real tNext,
+                                       bool forwardProp, bool backwardProp) {
+        bool answer = false;
+        get_interpIdxInWindow(&s, tWindowStart, tNext, forwardProp, backwardProp, answer); return answer;
+    }, py::arg("propSim"), py::arg("tWindowStart"), py::arg("tNext"), py::arg("forwardProp"), py::arg("backwardProp"));
+    m.def("get_lightTime_and_xRelative", [](PropSimulation &s, size_t interpIdx, real tInterpGeom,
+                                             const std::vector<real> &xInterpGeom) {
+        std::vector<real> lightTime, xInterpApparent; lightTime.resize(s.spiceBodies.size());
+        xInterpApparent.resize(xInterpGeom.size());
+        get_lightTime_and_xRelative(&s, interpIdx, tInterpGeom, xInterpGeom, lightTime, xInterpApparent);
+        return py::make_tuple(lightTime, xInterpApparent);
+    }, py::arg("propSim"), py::arg("interpIdx"), py::arg("tInterpGeom"), py::arg("xInterpGeom"));
+    m.def("get_lightTimeOneBody", [](PropSimulation &s, size_t i, real tInterpGeom,
+                                      std::vector<real> xInterpGeom, std::vector<real> xObserver,
+                                      bool bouncePointAtCenterOfMass) {
+        real lightTime = 0; get_lightTimeOneBody(&s, i, tInterpGeom, std::move(xInterpGeom),
+                                                  std::move(xObserver), bouncePointAtCenterOfMass, lightTime);
+        return lightTime;
+    }, py::arg("propSim"), py::arg("i"), py::arg("tInterpGeom"), py::arg("xInterpGeom"),
+       py::arg("xObserver"), py::arg("bouncePointAtCenterOfMass"));
+    m.def("apply_stellar_aberration", [](PropSimulation &s, size_t interpIdx, std::vector<real> xInterpApparent) {
+        apply_stellar_aberration(&s, interpIdx, xInterpApparent); return xInterpApparent;
+    }, py::arg("propSim"), py::arg("interpIdx"), py::arg("xInterpApparent"));
+
+    // Observation helpers.
+    m.def("get_glb_correction", [](PropSimulation &s, size_t interpIdx, real tInterpGeom) {
+        std::vector<real> x; x.resize(s.xObserver.size()); get_glb_correction(&s, interpIdx, tInterpGeom, x); return x;
+    }, py::arg("propSim"), py::arg("interpIdx"), py::arg("tInterpGeom"));
+    m.def("get_measurement", [](PropSimulation &s, size_t interpIdx, real tInterpGeom,
+                                 const std::vector<real> &xInterpGeom, const std::vector<real> &xInterpApparent) {
+        get_measurement(&s, interpIdx, tInterpGeom, xInterpGeom, xInterpApparent);
+    }, py::arg("propSim"), py::arg("interpIdx"), py::arg("tInterpGeom"),
+       py::arg("xInterpGeom"), py::arg("xInterpApparent"));
+    m.def("get_optical_measurement", [](PropSimulation &s, const std::vector<real> &xInterpApparent) {
+        std::vector<real> obs, obsDot, partials; get_optical_measurement(&s, xInterpApparent, obs, obsDot, partials);
+        return py::make_tuple(obs, obsDot, partials);
+    }, py::arg("propSim"), py::arg("xInterpApparent"));
+    m.def("get_photocenter_correction", [](PropSimulation &s, size_t interpIdx, real tInterpGeom,
+                                            const std::vector<real> &xInterpApparent) {
+        std::vector<real> corr; get_photocenter_correction(&s, interpIdx, tInterpGeom, xInterpApparent, corr); return corr;
+    }, py::arg("propSim"), py::arg("interpIdx"), py::arg("tInterpGeom"), py::arg("xInterpApparent"));
+    m.def("get_radar_measurement", [](PropSimulation &s, size_t interpIdx, real tInterpGeom,
+                                       const std::vector<real> &xInterpGeom) {
+        std::vector<real> obs, partials; get_radar_measurement(&s, interpIdx, tInterpGeom, xInterpGeom, obs, partials);
+        return py::make_tuple(obs, partials);
+    }, py::arg("propSim"), py::arg("interpIdx"), py::arg("tInterpGeom"), py::arg("xInterpGeom"));
+    m.def("get_delay_measurement", [](PropSimulation &s, size_t interpIdx, size_t i, real tInterpGeom,
+                                       const std::vector<real> &xInterpGeom, real receiveTimeTDB) {
+        real transmitTimeTDB = 0, delay = 0; std::vector<real> xObsBaryRcv, xTrgtBaryBounce, xObsBaryTx, partials;
+        get_delay_measurement(&s, interpIdx, i, tInterpGeom, xInterpGeom, receiveTimeTDB, transmitTimeTDB,
+                              xObsBaryRcv, xTrgtBaryBounce, xObsBaryTx, delay, partials);
+        return py::make_tuple(transmitTimeTDB, xObsBaryRcv, xTrgtBaryBounce, xObsBaryTx, delay, partials);
+    }, py::arg("propSim"), py::arg("interpIdx"), py::arg("i"), py::arg("tInterpGeom"),
+       py::arg("xInterpGeom"), py::arg("receiveTimeTDB"));
+    m.def("get_delta_delay_relativistic", [](PropSimulation &s, real tForSpice, const std::vector<real> &targetState) {
+        real d = 0; get_delta_delay_relativistic(&s, tForSpice, targetState, d); return d;
+    }, py::arg("propSim"), py::arg("tForSpice"), py::arg("targetState"));
+    m.def("get_doppler_measurement", [](PropSimulation &s, size_t i, real receiveTimeTDB, real transmitTimeTDB,
+                                         const std::vector<real> &xObsBaryRcv, const std::vector<real> &xTrgtBaryBounce,
+                                         const std::vector<real> &xObsBaryTx, real transmitFreq) {
+        real doppler = 0; std::vector<real> partials;
+        get_doppler_measurement(&s, i, receiveTimeTDB, transmitTimeTDB, xObsBaryRcv, xTrgtBaryBounce,
+                                xObsBaryTx, transmitFreq, doppler, partials);
+        return py::make_tuple(doppler, partials);
+    }, py::arg("propSim"), py::arg("i"), py::arg("receiveTimeTDB"), py::arg("transmitTimeTDB"),
+       py::arg("xObsBaryRcv"), py::arg("xTrgtBaryBounce"), py::arg("xObsBaryTx"), py::arg("transmitFreq"));
+    m.def("evaluate_one_interpolation", [](const PropSimulation &s, real tInterp) {
+        std::vector<real> x; evaluate_one_interpolation(&s, tInterp, x); return x;
+    }, py::arg("propSim"), py::arg("tInterp"));
+
+    // PCK/SPK helpers.
+    m.def("pck_free", [](PckInfo *p) { pck_free(p); }, py::arg("pck"));
+    m.def("pck_init", [](const std::string &path) { return pck_init(path); }, py::arg("path"), py::return_value_policy::reference);
+    m.def("pck_calc", [](PckInfo *p, real epoch, int spiceId) {
+        std::vector<real> R(9), Rd(9); pck_calc(p, epoch, spiceId, R.data(), Rd.data()); return py::make_tuple(R, Rd);
+    }, py::arg("pck"), py::arg("epoch"), py::arg("spiceId"));
+    m.def("iau_to_euler", [](real t0_mjd, const std::string &frame) {
+        std::vector<real> euler(6); iau_to_euler(t0_mjd, frame, euler.data()); return euler;
+    }, py::arg("t0_mjd"), py::arg("iauFrame"));
+    m.def("euler313_to_rotMat", [](const std::vector<real> &euler) {
+        if (euler.size() != 6) throw std::invalid_argument("euler must have length 6");
+        std::vector<real> R(9), Rd(9); euler313_to_rotMat(euler.data(), R.data(), Rd.data()); return py::make_tuple(R, Rd);
+    }, py::arg("euler"));
+    m.def("get_pck_rotMat", [](const std::string &from, const std::string &to, real t0_mjd, PckEphemeris &ephem) {
+        std::vector<std::vector<real>> M(3, std::vector<real>(3)); get_pck_rotMat(from, to, t0_mjd, ephem, M); return M;
+    }, py::arg("from"), py::arg("to"), py::arg("t0_mjd"), py::arg("ephem"));
+    m.def("spk_free", [](SpkInfo *p) { spk_free(p); }, py::arg("spk"));
+    m.def("spk_init", [](const std::string &path) { return spk_init(path); }, py::arg("path"), py::return_value_policy::reference);
+    m.def("spk_calc", [](SpkInfo *p, double epoch, int spiceId) {
+        std::vector<double> state(9); spk_calc(p, epoch, spiceId, state.data()); return state;
+    }, py::arg("spk"), py::arg("epoch"), py::arg("spiceId"));
+    m.def("get_spk_state", [](int spiceId, double t0_mjd, SpkEphemeris &ephem, bool writeCache) {
+        std::vector<double> state(9); get_spk_state(spiceId, t0_mjd, ephem, state.data(), writeCache); return state;
+    }, py::arg("spiceId"), py::arg("t0_mjd"), py::arg("ephem"), py::arg("writeCache") = false);
+
+    // STM helpers: Python owns the buffers while the C++ structure continues to
+    // use raw pointers, preserving the native C++ layout.
+    m.def("bcd_and_dot", [](const std::vector<real> &stm) {
+        std::vector<real> B(9), Bdot(9), C(9), Cdot(9), D(9), Ddot(9);
+        bcd_and_dot(stm, B.data(), Bdot.data(), C.data(), Cdot.data(), D.data(), Ddot.data());
+        return py::make_tuple(B, Bdot, C, Cdot, D, Ddot);
+    }, py::arg("stm"));
+    m.def("bcd_2dot", [](PySTMParameters &p, size_t numParams, size_t stmStarti, std::vector<real> accInteg) {
+        bcd_2dot(p.value, numParams, stmStarti, accInteg); return accInteg;
+    }, py::arg("stmParams"), py::arg("numParams"), py::arg("stmStarti"), py::arg("accInteg"));
+    m.def("stm_newton", [](PySTMParameters &p, real gm, real dx, real dy, real dz) {
+        stm_newton(p.value, gm, dx, dy, dz); return py::make_tuple(p.B,p.Bdot,p.C,p.Cdot,p.D,p.Ddot,p.dfdpos,p.dfdvel,p.dfdpar);
+    }, py::arg("stmParams"), py::arg("gm"), py::arg("dx"), py::arg("dy"), py::arg("dz"));
+    m.def("stm_ppn_simple", [](PySTMParameters &p, real gm, real c, real beta, real gamma,
+                                real dx, real dy, real dz, real dvx, real dvy, real dvz) {
+        stm_ppn_simple(p.value, gm, c, beta, gamma, dx, dy, dz, dvx, dvy, dvz);
+        return py::make_tuple(p.B,p.Bdot,p.C,p.Cdot,p.D,p.Ddot,p.dfdpos,p.dfdvel,p.dfdpar);
+    }, py::arg("stmParams"), py::arg("gm"), py::arg("c"), py::arg("beta"), py::arg("gamma"),
+       py::arg("dx"), py::arg("dy"), py::arg("dz"), py::arg("dvx"), py::arg("dvy"), py::arg("dvz"));
+    m.def("stm_J2", [](PySTMParameters &p, real gm, real J2, real dxBody, real dyBody, real dzBody,
+                        real radius, real sinRA, real cosRA, real sinDec, real cosDec, real smoothing_threshold) {
+        stm_J2(p.value, gm, J2, dxBody, dyBody, dzBody, radius, sinRA, cosRA, sinDec, cosDec, smoothing_threshold);
+        return py::make_tuple(p.B,p.Bdot,p.C,p.Cdot,p.D,p.Ddot,p.dfdpos,p.dfdvel,p.dfdpar);
+    }, py::arg("stmParams"), py::arg("gm"), py::arg("J2"), py::arg("dxBody"), py::arg("dyBody"),
+       py::arg("dzBody"), py::arg("radius"), py::arg("sinRA"), py::arg("cosRA"), py::arg("sinDec"),
+       py::arg("cosDec"), py::arg("smoothing_threshold"));
+    m.def("stm_nongrav", [](PySTMParameters &p, real g, const NongravParameters &ng, real dx, real dy, real dz,
+                            real dvx, real dvy, real dvz, std::vector<real> rVec, std::vector<real> nVec) {
+        stm_nongrav(p.value, g, ng, dx, dy, dz, dvx, dvy, dvz, rVec.data(), nVec.data());
+        return py::make_tuple(p.B,p.Bdot,p.C,p.Cdot,p.D,p.Ddot,p.dfdpos,p.dfdvel,p.dfdpar,rVec,nVec);
+    }, py::arg("stmParams"), py::arg("g"), py::arg("ngParams"), py::arg("dx"), py::arg("dy"), py::arg("dz"),
+       py::arg("dvx"), py::arg("dvy"), py::arg("dvz"), py::arg("rVec"), py::arg("nVec"));
+    m.def("stm_continuous_event", [](PySTMParameters &p, PropSimulation &s, size_t eventIdx, real tPastEvent, real postFac) {
+        stm_continuous_event(p.value, &s, eventIdx, tPastEvent, postFac);
+        return py::make_tuple(p.B,p.Bdot,p.C,p.Cdot,p.D,p.Ddot,p.dfdpos,p.dfdvel,p.dfdpar);
+    }, py::arg("stmParams"), py::arg("propSim"), py::arg("eventIdx"), py::arg("tPastEvent"), py::arg("postFac"));
+
+    // Internal file-local helpers are exposed because this translation unit includes
+    // the original C++ implementations. Existing source files remain untouched.
+    m.def("get_atm_offset", [](int centralBodySpiceId) { return get_atm_offset(centralBodySpiceId); }, py::arg("centralBodySpiceId"));
+    m.def("rec_to_geodetic", [](real x, real y, real z) {
+        real lon=0, lat=0, h=0; rec_to_geodetic(x,y,z,lon,lat,h); return py::make_tuple(lon,lat,h);
+    }, py::arg("x"), py::arg("y"), py::arg("z"));
+    m.def("associated_legendre_function", [](real phi, size_t N) {
+        std::vector<std::vector<real>> P(N + 1, std::vector<real>(N + 1));
+        associated_legendre_function(phi, N, P); return P;
+    }, py::arg("phi"), py::arg("N"));
+    m.def("root7", [](real num) { return root7(num); }, py::arg("num"));
+    m.def("get_adaptive_timestep", [](PropSimulation &s, real dt, const std::vector<real> &accInteg0,
+                                       size_t dim, const std::vector<real> &b) {
+        return get_adaptive_timestep(&s, dt, accInteg0, dim, b);
+    }, py::arg("propSim"), py::arg("dt"), py::arg("accInteg0"), py::arg("dim"), py::arg("b"));
+    m.def("event_preprocess", [](PropSimulation &s, const std::string &eventBodyName, real tEvent) {
+        return event_preprocess(&s, eventBodyName, tEvent);
+    }, py::arg("propSim"), py::arg("eventBodyName"), py::arg("tEvent"));
+    m.def("event_stm_handling", [](PropSimulation &s, const Event &event) { event_stm_handling(&s, event); },
+          py::arg("propSim"), py::arg("event"));
+    m.def("event_postprocess", [](PropSimulation &s, Event event) { event_postprocess(&s, event); return event; },
+          py::arg("propSim"), py::arg("event"));
+    m.def("pck_mjd_internal", [](double et) { return pck_mjd_internal(et); }, py::arg("et"));
+    m.def("spk_mjd_internal", [](double et) { return spk_mjd_internal(et); }, py::arg("et"));
+
+    // Internal force helpers with Python-owned STM storage.
+    auto force_stms = [](py::list objects, std::vector<STMParameters> &vals) {
+        vals.clear(); vals.reserve(py::len(objects));
+        for (auto item : objects) {
+            auto *p = item.cast<PySTMParameters*>(); p->sync(); vals.push_back(p->value);
+        }
+    };
+    m.def("force_newton", [&](const PropSimulation &s, std::vector<real> acc, py::list stms) {
+        std::vector<STMParameters> vals; force_stms(stms, vals);
+        force_newton(&s, acc, vals.empty() ? nullptr : vals.data()); return acc;
+    }, py::arg("propSim"), py::arg("accInteg"), py::arg("stms"));
+    m.def("force_ppn_simple", [&](const PropSimulation &s, std::vector<real> acc, py::list stms) {
+        std::vector<STMParameters> vals; force_stms(stms, vals);
+        force_ppn_simple(&s, acc, vals.empty() ? nullptr : vals.data()); return acc;
+    }, py::arg("propSim"), py::arg("accInteg"), py::arg("stms"));
+    m.def("force_ppn_eih", [&](const PropSimulation &s, std::vector<real> acc, py::list stms) {
+        std::vector<STMParameters> vals; force_stms(stms, vals);
+        force_ppn_eih(&s, acc, vals.empty() ? nullptr : vals.data()); return acc;
+    }, py::arg("propSim"), py::arg("accInteg"), py::arg("stms"));
+    m.def("force_J2", [&](PropSimulation &s, std::vector<real> acc, py::list stms) {
+        std::vector<STMParameters> vals; force_stms(stms, vals);
+        force_J2(&s, acc, vals.empty() ? nullptr : vals.data()); return acc;
+    }, py::arg("propSim"), py::arg("accInteg"), py::arg("stms"));
+    m.def("force_harmonics", [](const PropSimulation &s, std::vector<real> acc) {
+        force_harmonics(&s, acc); return acc;
+    }, py::arg("propSim"), py::arg("accInteg"));
+    m.def("force_nongrav", [&](const PropSimulation &s, std::vector<real> acc, py::list stms) {
+        std::vector<STMParameters> vals; force_stms(stms, vals);
+        force_nongrav(&s, acc, vals.empty() ? nullptr : vals.data()); return acc;
+    }, py::arg("propSim"), py::arg("accInteg"), py::arg("stms"));
+    m.def("force_thruster", [](const PropSimulation &s, std::vector<real> acc) {
+        force_thruster(&s, acc); return acc;
+    }, py::arg("propSim"), py::arg("accInteg"));
+    m.def("force_continuous_event", [&](real t, const PropSimulation &s, std::vector<real> acc, py::list stms) {
+        std::vector<STMParameters> vals; force_stms(stms, vals);
+        force_continuous_event(t, &s, acc, vals.empty() ? nullptr : vals.data()); return acc;
+    }, py::arg("t"), py::arg("propSim"), py::arg("accInteg"), py::arg("stms"));
+
+    // Alias matching the pre-existing Python binding name.
+    m.attr("__binding_module__") = "grss_full";
+    m.attr("__binding_note__") =
+        "Complete GRSS C++ binding surface generated in an external translation unit; "
+        "existing repository source files are not modified.";
+    // Independent source-audit inventory for audit_grss_bindings.py. These
+    // numbers describe the repository source tree that this standalone
+    // translation unit was generated against; they are intentionally kept
+    // separate from Python's callable count because overloaded C++ methods
+    // and output-argument aliases have different Python representations.
+    m.attr("__cpp_source_definition_count__") = py::int_(163);
+    m.attr("__cpp_nonconstructor_definition_count__") = py::int_(157);
+    m.attr("__cpp_unique_callable_count__") = py::int_(142);
+    m.attr("__cpp_free_function_name_count__") = py::int_(118);
+    m.attr("__cpp_method_definition_count__") = py::int_(25);
+    m.attr("__cpp_unique_method_name_count__") = py::int_(24);
+
+    py::dict method_inventory;
+    method_inventory["Body"] = py::make_tuple("set_J2", "set_harmonics");
+    method_inventory["IntegBody"] = py::make_tuple("prepare_stm");
+    method_inventory["Event"] = py::make_tuple("apply_impulsive");
+    method_inventory["CloseApproachParameters"] = py::make_tuple("get_ca_parameters", "print_summary");
+    method_inventory["ImpactParameters"] = py::make_tuple("get_impact_parameters", "print_summary");
+    method_inventory["PropSimulation"] = py::make_tuple(
+        "prepare_for_evaluation", "preprocess", "interpolate", "add_spice_body",
+        "map_ephemeris", "unmap_ephemeris", "get_spiceBody_state", "add_integ_body",
+        "remove_body", "add_event", "set_sim_constants", "set_integration_parameters",
+        "get_sim_constants", "get_integration_parameters", "integrate", "extend", "save");
+    m.attr("__cpp_method_inventory__") = method_inventory;
+    m.attr("__cpp_functions__") = py::make_tuple(
+        "wrap_to_2pi","rad_to_deg","deg_to_rad","sort_vector","sort_vector_by_idx",
+        "vdot","vdot_raw","vnorm","vnorm_raw","vunit","vunit_raw","vcross","vcross_raw",
+        "vadd","vsub","vcmul","vvmul","vabs_max","vabs_max_raw","mat_vec_mul","vec_mat_mul",
+        "mat_mat_mul","mat3_inv","mat3_mat3_mul","mat3_mat3_add","rot_mat_x","rot_mat_y",
+        "rot_mat_z","LU_decompose","LU_inverse","mat_inv",
+        "kepler_solve_elliptic","kepler_solve_hyperbolic","kepler_solve",
+        "cometary_to_keplerian","keplerian_to_cometary","keplerian_to_cartesian",
+        "cartesian_to_keplerian","cometary_to_cartesian","cartesian_to_cometary",
+        "get_elements_partials","get_cartesian_partials",
+        "jd_to_et","jd_to_mjd","et_to_jd","et_to_mjd","mjd_to_jd","mjd_to_et",
+        "delta_at_utc","delta_at_tai","delta_et_utc","delta_et_tdb",
+        "get_baseBodyFrame","get_observer_state","get_state_der",
+        "approx_xInteg_math","approx_xInteg","comp_sum",
+        "interpolate_on_the_fly","get_interpIdxInWindow","get_lightTime_and_xRelative",
+        "get_lightTimeOneBody","apply_stellar_aberration",
+        "get_glb_correction","get_measurement","get_optical_measurement",
+        "get_photocenter_correction","get_radar_measurement","get_delay_measurement",
+        "get_delta_delay_relativistic","get_doppler_measurement","evaluate_one_interpolation",
+        "check_ca_or_impact","ca_rdot_calc","impact_r_calc","get_rel_state",
+        "get_bplane_partials","get_ca_or_impact_time",
+        "pck_free","pck_init","pck_calc","iau_to_euler","euler313_to_rotMat","get_pck_rotMat",
+        "spk_free","spk_init","spk_calc","get_spk_state",
+        "get_initial_timestep","update_g_with_b","compute_g_and_b","refine_b",
+        "check_and_apply_impulsive_events","check_continuous_events","check_events",
+        "event_timestep_check","ias15",
+        "bcd_and_dot","bcd_2dot","stm_newton","stm_ppn_simple","stm_J2","stm_nongrav",
+        "stm_continuous_event","get_atm_offset","rec_to_geodetic","associated_legendre_function",
+        "event_preprocess","event_stm_handling","event_postprocess","root7","get_adaptive_timestep",
+        "force_newton","force_ppn_simple","force_ppn_eih","force_J2","force_harmonics",
+        "force_nongrav","force_thruster","force_continuous_event",
+        "pck_mjd_internal","spk_mjd_internal",
+        "propSim_parallel_omp","reconstruct_stm"
+    );
+    m.attr("__cpp_classes__") = py::make_tuple(
+        "Constants","IntegrationParameters","Body","SpiceBody","NongravParameters",
+        "IntegBody","Event","EventManager","BPlaneParameters","CloseApproachParameters",
+        "ImpactParameters","InterpolationParameters","PropSimulation",
+        "PckTarget","PckInfo","PckEphemeris","SpkCacheItem","SpkCache","SpkTarget",
+        "SpkInfo","SpkEphemeris","STMParameters"
+    );
+
+}

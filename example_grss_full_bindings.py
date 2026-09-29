@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Build and smoke-test grss_full_bindings.cpp without modifying the GRSS sources."""
+
+from __future__ import annotations
+
+import math
+import os
+import shutil
+import subprocess
+import sys
+import sysconfig
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+BINDING = ROOT / "grss_full_bindings.cpp"
+EXT_SUFFIX = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
+MODULE_PATH = ROOT / f"grss_full{EXT_SUFFIX}"
+
+
+def find_pybind11_include() -> Path:
+    """Locate pybind11 headers used by the standalone binding translation unit."""
+    try:
+        import pybind11  # type: ignore
+
+        include = Path(pybind11.get_include())
+        if (include / "pybind11.h").exists():
+            return include
+    except Exception:
+        pass
+
+    # Common case when pybind11 is installed as part of another Python package.
+    for base in map(Path, sys.path):
+        for candidate in (base / "pybind11", base / "pybind11" / "include"):
+            if (candidate / "pybind11.h").exists():
+                return candidate
+
+    # PyTorch distributions often carry a complete pybind11 header tree.
+    try:
+        import torch  # type: ignore
+
+        candidate = Path(torch.__file__).resolve().parent / "include"
+        if (candidate / "pybind11" / "pybind11.h").exists():
+            return candidate
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "Could not find pybind11 headers. Install the pybind11 development package "
+        "(the GRSS CMake build already requires pybind11)."
+    )
+
+
+def find_openmp_toolchain() -> tuple[str, list[str], list[str]]:
+    """Find a C++ compiler/toolchain that can compile GRSS's OpenMP code.
+
+    On macOS, /usr/bin/g++ is Apple Clang, not GNU GCC, and Apple Clang does
+    not accept -fopenmp. Prefer Homebrew GCC; otherwise use an LLVM+libomp
+    installation when one is available.
+    """
+    explicit = os.environ.get("CXX")
+    candidates: list[str] = []
+    if explicit:
+        candidates.append(explicit)
+
+    if sys.platform == "darwin":
+        # Homebrew GCC is installed as versioned executables (g++-NN).
+        for version in range(20, 8, -1):
+            candidates.extend([
+                f"g++-{version}",
+                f"gcc-{version}",
+            ])
+
+        # Homebrew LLVM's clang++ supports OpenMP when paired with libomp.
+        candidates.extend([
+            "/opt/homebrew/opt/llvm/bin/clang++",
+            "/usr/local/opt/llvm/bin/clang++",
+        ])
+    else:
+        candidates.extend(["g++", "c++", "clang++"])
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        resolved = shutil.which(candidate) if os.path.sep not in candidate else candidate
+        if not resolved or not Path(resolved).exists():
+            continue
+
+        # GNU GCC: the direct OpenMP flag is sufficient.
+        try:
+            version = subprocess.check_output(
+                [resolved, "--version"], text=True, stderr=subprocess.STDOUT
+            )
+        except Exception:
+            continue
+
+        executable_name = Path(resolved).name.lower()
+        is_gnu_compiler = (
+            "Apple clang" not in version
+            and "Apple LLVM" not in version
+            and (
+                "gcc" in version.lower()
+                or "gnu" in version.lower()
+                or executable_name.startswith("g++")
+                or executable_name.startswith("gcc")
+            )
+        )
+        if is_gnu_compiler:
+            return resolved, ["-fopenmp"], []
+
+        # LLVM/Clang on macOS: use Apple's supported frontend spelling and
+        # point it at libomp if the common Homebrew locations exist.
+        if "clang" in version.lower():
+            omp_roots = [
+                Path("/opt/homebrew/opt/libomp"),
+                Path("/usr/local/opt/libomp"),
+            ]
+            for root in omp_roots:
+                include = root / "include"
+                lib = root / "lib"
+                if (include / "omp.h").exists() and (lib / "libomp.dylib").exists():
+                    return resolved, ["-Xpreprocessor", "-fopenmp", f"-I{include}"], [f"-L{lib}", "-lomp"]
+
+    if sys.platform == "darwin":
+        raise RuntimeError(
+            "No OpenMP-capable C++ compiler was found. On macOS, Apple Clang "
+            "(/usr/bin/g++) cannot compile GRSS because it does not provide OpenMP. "
+            "Install GNU GCC with Homebrew (for example: brew install gcc) and "
+            "rerun this example, or set CXX to a Homebrew g++-NN executable. "
+            "Alternatively install Homebrew llvm and libomp. The GRSS source "
+            "files themselves do not need to be changed."
+        )
+
+    raise RuntimeError(
+        "No C++ compiler with OpenMP support was found. Set CXX to a compiler "
+        "that supports OpenMP (for example GCC)."
+    )
+
+
+def build_extension() -> None:
+    if not BINDING.exists():
+        raise FileNotFoundError(f"Missing binding source: {BINDING}")
+
+    if MODULE_PATH.exists() and MODULE_PATH.stat().st_mtime >= BINDING.stat().st_mtime:
+        return
+
+    if os.name == "nt":
+        raise RuntimeError(
+            "This standalone example follows the POSIX/OpenMP toolchain used by GRSS. "
+            "Use the project's supported CMake toolchain on Windows."
+        )
+
+    cxx, openmp_compile_flags, openmp_link_flags = find_openmp_toolchain()
+    pybind_include = find_pybind11_include()
+    python_include = sysconfig.get_paths()["include"]
+
+    platform_flags = ["-std=c++11", "-O2", "-fPIC"]
+    platform_flags.append("-dynamiclib" if sys.platform == "darwin" else "-shared")
+
+    # Python extension modules on macOS intentionally leave the Python C API
+    # symbols unresolved; the active Python interpreter supplies them at import.
+    # Without this flag, GNU ld will report missing _Py* symbols at link time.
+    mac_link_flags = ["-Wl,-undefined,dynamic_lookup"] if sys.platform == "darwin" else []
+
+    command = [
+        cxx,
+        *platform_flags,
+        *openmp_compile_flags,
+        f"-I{python_include}",
+        f"-I{pybind_include}",
+        f"-I{ROOT / 'include'}",
+        str(BINDING),
+        *openmp_link_flags,
+        *mac_link_flags,
+        "-o",
+        str(MODULE_PATH),
+    ]
+    print("Building grss_full extension...")
+    print(" ".join(command))
+    subprocess.run(command, check=True, cwd=ROOT)
+
+
+def assert_close(value: float, expected: float, tol: float = 1e-10) -> None:
+    if not math.isclose(value, expected, rel_tol=tol, abs_tol=tol):
+        raise AssertionError(f"{value!r} != {expected!r}")
+
+
+def main() -> int:
+    build_extension()
+    sys.path.insert(0, str(ROOT))
+
+    import grss_full  # noqa: E402
+
+    advertised = tuple(grss_full.__cpp_functions__)
+    missing = [name for name in advertised if not hasattr(grss_full, name)]
+    if missing:
+        raise AssertionError(f"Missing advertised bindings: {missing}")
+
+    # Verify representative functions from several C++ subsystems.
+    assert_close(grss_full.jd_to_mjd(2451545.0), 51544.5)
+    assert_close(grss_full.rad_to_deg(math.pi), 180.0)
+    assert grss_full.vdot([1, 2, 3], [4, 5, 6]) == 32.0
+    assert grss_full.mat_inv([[2.0, 0.0], [0.0, 4.0]]) == [[0.5, 0.0], [0.0, 0.25]]
+    assert_close(grss_full.kepler_solve_elliptic(0.1, 0.1), 0.11108574153383012)
+    assert_close(grss_full.root7(128.0), 2.0)
+
+    body = grss_full.Body()
+    body.pos = [1.0, 2.0, 3.0]
+    body.vel = [4.0, 5.0, 6.0]
+    body.acc = [7.0, 8.0, 9.0]
+    assert body.pos == [1.0, 2.0, 3.0]
+    assert body.vel == [4.0, 5.0, 6.0]
+    assert body.acc == [7.0, 8.0, 9.0]
+
+    simulation = grss_full.PropSimulation("binding_smoke", 51544.5, 0, "")
+    assert grss_full.get_baseBodyFrame(399, 51544.5) == "ITRF93"
+
+    stm = grss_full.STMParameters(2)
+    assert len(stm.B) == 9
+    assert len(stm.dfdpos) == 9
+    assert len(stm.dfdpar) == 6
+
+    # Verify the class-method surface that is already attached to PropSimulation.
+    for method_name in (
+        "integrate",
+        "interpolate",
+        "add_event",
+        "add_integ_body",
+        "add_spice_body",
+        "remove_body",
+        "prepare_for_evaluation",
+        "preprocess",
+    ):
+        if not hasattr(simulation, method_name):
+            raise AssertionError(f"PropSimulation.{method_name} is not bound")
+
+    # Run the independent source inventory when the audit script accompanies this file.
+    audit = ROOT / "audit_grss_bindings.py"
+    if audit.exists():
+        print("Running exhaustive C++ -> Python binding audit...")
+        subprocess.run([sys.executable, str(audit)], check=True, cwd=ROOT)
+
+    print(f"grss_full module loaded from: {grss_full.__file__}")
+    print(f"Advertised free-function bindings: {len(advertised)}")
+    print("Representative C++ calls: PASS")
+    print("Representative class-method bindings: PASS")
+    print("GRSS full binding smoke test: PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

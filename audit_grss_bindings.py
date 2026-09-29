@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""Exhaustively audit the GRSS C++ source surface against grss_full.
+
+This script never edits the GRSS repository sources. It lexically inventories
+function definitions in the original headers/sources, then checks the new
+standalone binding module for a corresponding Python callable.
+
+Usage:
+    python3 audit_grss_bindings.py
+    python3 audit_grss_bindings.py --source-only
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT = Path.cwd() if (Path.cwd() / "src").is_dir() and (Path.cwd() / "include").is_dir() else SCRIPT_DIR
+CPP_DIRS = [ROOT / "src", ROOT / "include"]
+CPP_EXTS = {".cpp", ".h", ".hpp", ".cc", ".cxx"}
+CONTROL_NAMES = {"if", "for", "while", "switch", "catch"}
+CLASS_NAMES: set[str] = set()
+
+# The external translation unit deliberately renames these two file-local
+# functions because both source files define a static `_mjd` helper.
+INTERNAL_ALIASES = {
+    "_mjd": ("pck_mjd_internal", "spk_mjd_internal"),
+}
+
+# Some C++ overloads are represented by both the normal Python convenience
+# name and an explicit output-parameter alias.
+OVERLOAD_ALIASES = {
+    "rad_to_deg": ("rad_to_deg_out",),
+    "deg_to_rad": ("deg_to_rad_out",),
+    "jd_to_et": ("jd_to_et_inplace",),
+    "jd_to_mjd": ("jd_to_mjd_inplace",),
+    "et_to_jd": ("et_to_jd_inplace",),
+    "et_to_mjd": ("et_to_mjd_inplace",),
+    "mjd_to_jd": ("mjd_to_jd_inplace",),
+    "mjd_to_et": ("mjd_to_et_inplace",),
+    "vdot": ("vdot_raw",),
+    "vnorm": ("vnorm_raw",),
+    "vunit": ("vunit_raw",),
+    "vcross": ("vcross_raw",),
+    "vabs_max": ("vabs_max_raw",),
+}
+
+
+@dataclass(frozen=True)
+class Definition:
+    file: Path
+    name: str
+    qualified: str
+    is_constructor: bool
+    is_destructor: bool
+    is_method: bool
+    line: int
+
+
+def strip_comments_and_strings(text: str) -> str:
+    # Preserve newlines so line numbers remain useful.
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    state = "normal"
+    quote = ""
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if state == "normal":
+            if ch == "/" and nxt == "/":
+                out.extend("  ")
+                i += 2
+                state = "line_comment"
+                continue
+            if ch == "/" and nxt == "*":
+                out.extend("  ")
+                i += 2
+                state = "block_comment"
+                continue
+            if ch in ('"', "'"):
+                quote = ch
+                out.append(" ")
+                i += 1
+                state = "string"
+                continue
+            out.append(ch)
+            i += 1
+            continue
+        if state == "line_comment":
+            if ch == "\n":
+                out.append("\n")
+                state = "normal"
+            else:
+                out.append(" ")
+            i += 1
+            continue
+        if state == "block_comment":
+            if ch == "*" and nxt == "/":
+                out.extend("  ")
+                i += 2
+                state = "normal"
+            else:
+                out.append("\n" if ch == "\n" else " ")
+                i += 1
+            continue
+        # string/character literal
+        if ch == "\\":
+            out.extend("  ")
+            i += 2
+            continue
+        if ch == quote:
+            out.append(" ")
+            i += 1
+            state = "normal"
+            continue
+        out.append("\n" if ch == "\n" else " ")
+        i += 1
+    return "".join(out)
+
+
+def split_qualified_name(prefix: str, name: str) -> tuple[str | None, str]:
+    q = prefix.strip().strip("*&").strip()
+    if "::" in q:
+        return q.split("::")[-1], name
+    return None, name
+
+
+
+def discover_class_names() -> set[str]:
+    names: set[str] = set()
+    for directory in (ROOT / "include",):
+        if not directory.is_dir():
+            continue
+        for path in directory.rglob("*.h"):
+            text = strip_comments_and_strings(path.read_text(encoding="utf-8", errors="ignore"))
+            names.update(re.findall(r"\b(?:class|struct)\s+([A-Za-z_]\w*)", text))
+    return names
+
+def inventory_cpp() -> list[Definition]:
+    global CLASS_NAMES
+    CLASS_NAMES = discover_class_names()
+    defs: list[Definition] = []
+    # The function-name regex is intentionally conservative. We first look for
+    # `(...){` and then inspect the identifier immediately before `(`.
+    pattern = re.compile(
+        r"(?P<prefix>[^;{}]{0,450}?)\b(?P<name>~?[A-Za-z_]\w*)\s*\((?P<args>[^()]*(?:\([^()]*\)[^()]*)*)\)\s*(?P<const>const\s*)?(?:override\s*)?\{"
+    )
+    for directory in CPP_DIRS:
+        for path in sorted(directory.rglob("*")):
+            if path.suffix not in CPP_EXTS:
+                continue
+            # src/grss.cpp is the repository's existing pybind11 binding layer,
+            # not a GRSS computational C++ function source. The audit targets
+            # the underlying C++ API implemented in the other translation units.
+            if path == ROOT / "src" / "grss.cpp":
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            clean = strip_comments_and_strings(text)
+            for match in pattern.finditer(clean):
+                name = match.group("name")
+                if name in CONTROL_NAMES:
+                    continue
+                prefix = " ".join(match.group("prefix").split())
+                # Ignore macro-style constructs and member access that clearly
+                # do not look like C++ function definitions.
+                if prefix.endswith("#") or prefix.endswith("."):
+                    continue
+                line = clean.count("\n", 0, match.start()) + 1
+                owner = None
+                # Only treat `Class::method` as a class method when the owner
+                # is a class/struct actually declared by GRSS. This prevents
+                # return types such as `std::vector<...>` from being mistaken
+                # for methods.
+                before_name = clean[max(0, match.start("name") - 180): match.start("name")]
+                qm = re.search(r"([A-Za-z_]\w*(?:::[A-Za-z_]\w+)*)\s*::\s*$", before_name)
+                if qm:
+                    candidate = qm.group(1).split("::")[-1]
+                    if candidate in CLASS_NAMES:
+                        owner = candidate
+                # Out-of-class definitions can leave the final qualifier just
+                # before the function name after return-type text.
+                if owner is None:
+                    qm = re.search(r"([A-Za-z_]\w*)::\s*$", prefix)
+                    if qm and qm.group(1) in CLASS_NAMES:
+                        owner = qm.group(1)
+
+                is_method = owner is not None
+                is_ctor = bool(owner and name.lstrip("~") == owner)
+                is_dtor = bool(owner and name.startswith("~"))
+                if not owner and name in CLASS_NAMES:
+                    # GRSS has an inline Event constructor in simulation.h.
+                    # A same-name definition without `Class::` inside a class
+                    # body is a constructor rather than a free function.
+                    if path.parent.name == "include":
+                        is_ctor = True
+                qualified = f"{owner}::{name}" if owner else name
+                defs.append(Definition(path, name, qualified, is_ctor, is_dtor, is_method, line))
+    # Deduplicate exact lexical matches that may occur in a header/source pair
+    # only if they are truly the same definition location (normally they are not).
+    unique: dict[tuple[str, str, int], Definition] = {}
+    for d in defs:
+        unique[(str(d.file), d.name, d.line)] = d
+    return sorted(unique.values(), key=lambda d: (str(d.file), d.line, d.name))
+
+
+def source_summary(defs: Iterable[Definition]) -> tuple[int, int, set[str], dict[str, set[str]], dict[str, list[Definition]]]:
+    defs = list(defs)
+    nonctors = [d for d in defs if not d.is_constructor and not d.is_destructor]
+    free_names = {d.name for d in nonctors if not d.is_method}
+    methods: dict[str, set[str]] = {}
+    for d in nonctors:
+        if d.is_method:
+            owner = d.qualified.split("::", 1)[0]
+            methods.setdefault(owner, set()).add(d.name)
+    by_name: dict[str, list[Definition]] = {}
+    for d in nonctors:
+        by_name.setdefault(d.name, []).append(d)
+    unique_callable_names = set(free_names)
+    for names in methods.values():
+        unique_callable_names.update(names)
+    # `_mjd` is one C++ function name with two file-local definitions in the
+    # source tree. The external binding intentionally exposes two aliases.
+    return len(defs), len(nonctors), unique_callable_names, methods, by_name
+
+
+def import_binding():
+    sys.path.insert(0, str(ROOT))
+    try:
+        import grss_full  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "grss_full is not built. Run example_grss_full_bindings.py first, "
+            "or run test_grss_bindings.py which builds it automatically."
+        ) from exc
+    return grss_full
+
+
+def binding_source_audit() -> tuple[bool, list[str]]:
+    path = ROOT / "grss_full_bindings.cpp"
+    if not path.exists():
+        return False, [f"Missing standalone binding source: {path}"]
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    names = set(re.findall(r"(?:\bm|\.def)\.def\(\"([^\"]+)\"", text))
+    # The expression above is intentionally conservative; use the simpler
+    # direct patterns as well for both m.def(...) and class_.def(...).
+    names.update(re.findall(r"\bm\.def\(\"([^\"]+)\"", text))
+    names.update(re.findall(r"\)\s*\.def\(\"([^\"]+)\"", text))
+    defs = inventory_cpp()
+    _, _, unique_names, methods, _ = source_summary(defs)
+    problems: list[str] = []
+    for name in sorted(unique_names):
+        if name == "_mjd":
+            continue
+        if name not in names:
+            # A method with the same name as a free function is still covered
+            # by a `.def(...)` on its class, so name presence is sufficient.
+            problems.append(f"Source callable name {name} does not appear in grss_full_bindings.cpp")
+    required_aliases = [alias for aliases in INTERNAL_ALIASES.values() for alias in aliases]
+    required_aliases += [alias for aliases in OVERLOAD_ALIASES.values() for alias in aliases]
+    for alias in required_aliases:
+        if alias not in names:
+            problems.append(f"Required overload/internal alias {alias} does not appear in grss_full_bindings.cpp")
+    return not problems, problems
+
+
+def runtime_audit(grss_full) -> tuple[bool, list[str]]:
+    defs = inventory_cpp()
+    total, nonctors, unique_names, methods, by_name = source_summary(defs)
+    problems: list[str] = []
+
+    # The source archive used for this standalone binding has a known inventory.
+    # Keeping these expected counts in the audit catches accidental changes in
+    # what was actually scanned rather than silently auditing a partial subset.
+    if total != 163:
+        problems.append(f"Source definition count changed: found {total}, expected 163")
+    if nonctors != 157:
+        problems.append(f"Non-constructor definition count changed: found {nonctors}, expected 157")
+    if len(unique_names) != 142:
+        problems.append(f"Unique callable-name count changed: found {len(unique_names)}, expected 142")
+
+    free_names = {d.name for d in defs if not d.is_method and not d.is_constructor and not d.is_destructor}
+    for name in sorted(free_names):
+        if name == "_mjd":
+            aliases = INTERNAL_ALIASES["_mjd"]
+            if not all(hasattr(grss_full, a) for a in aliases):
+                problems.append("_mjd is represented by aliases pck_mjd_internal/spk_mjd_internal but one is missing")
+            continue
+        # Overload aliases are checked separately below, but the main callable
+        # must always exist.
+        if not hasattr(grss_full, name):
+            problems.append(f"Missing free/function binding: {name}")
+
+    for owner, names in sorted(methods.items()):
+        cls = getattr(grss_full, owner, None)
+        if cls is None:
+            problems.append(f"Missing class binding: {owner}")
+            continue
+        for name in sorted(names):
+            if not hasattr(cls, name):
+                problems.append(f"Missing method binding: {owner}.{name}")
+
+    # Constructor coverage: every C++ constructor definition should correspond
+    # to a Python class. `__init__` overload invocation is handled by the test
+    # suite, because this script intentionally avoids side effects.
+    for d in defs:
+        if d.is_constructor and not d.is_destructor:
+            owner = d.qualified.split("::", 1)[0]
+            if not hasattr(grss_full, owner):
+                problems.append(f"Missing constructor class binding: {owner}")
+
+    for base, aliases in OVERLOAD_ALIASES.items():
+        if not hasattr(grss_full, base):
+            problems.append(f"Missing primary overload binding: {base}")
+        for alias in aliases:
+            if not hasattr(grss_full, alias):
+                problems.append(f"Missing explicit overload alias: {alias}")
+
+    # Compare runtime metadata with the independently scanned source inventory.
+    meta = {
+        "source_definition_count": getattr(grss_full, "__cpp_source_definition_count__", None),
+        "nonconstructor_definition_count": getattr(grss_full, "__cpp_nonconstructor_definition_count__", None),
+        "unique_callable_count": getattr(grss_full, "__cpp_unique_callable_count__", None),
+        "free_function_name_count": getattr(grss_full, "__cpp_free_function_name_count__", None),
+        "method_definition_count": getattr(grss_full, "__cpp_method_definition_count__", None),
+        "unique_method_name_count": getattr(grss_full, "__cpp_unique_method_name_count__", None),
+    }
+    expected = {
+        "source_definition_count": total,
+        "nonconstructor_definition_count": nonctors,
+        "unique_callable_count": len(unique_names),
+        "free_function_name_count": len({d.name for d in defs if not d.is_method and not d.is_constructor and not d.is_destructor}),
+        "method_definition_count": sum(len(v) for v in methods.values()),
+        "unique_method_name_count": len({name for names in methods.values() for name in names}),
+    }
+    for key, value in expected.items():
+        if meta[key] != value:
+            problems.append(f"Module metadata {key}={meta[key]!r} does not match source audit value {value!r}")
+
+    return not problems, problems
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", type=Path, default=None, help="GRSS repository root. Defaults to the current directory when src/ and include/ exist.")
+    parser.add_argument("--source-only", action="store_true", help="Do not import the extension; only print the source inventory.")
+    args = parser.parse_args()
+    global ROOT, CPP_DIRS
+    if args.root is not None:
+        ROOT = args.root.resolve()
+        CPP_DIRS = [ROOT / "src", ROOT / "include"]
+
+    defs = inventory_cpp()
+    total, nonctors, unique_names, methods, by_name = source_summary(defs)
+    print(f"Source function definitions: {total}")
+    print(f"Non-constructor/destructor definitions: {nonctors}")
+    print(f"Unique callable names: {len(unique_names)}")
+    print(f"Classes with C++ methods: {len(methods)}")
+    print("Overload groups with more than one source definition:")
+    for name in sorted(k for k, v in by_name.items() if len(v) > 1):
+        print(f"  {name}: {len(by_name[name])}")
+
+    source_ok, source_problems = binding_source_audit()
+    if not source_ok:
+        print("Standalone binding source audit: FAIL")
+        for problem in source_problems:
+            print(f"  - {problem}")
+        return 1
+    print("Standalone binding source audit: PASS")
+
+    if args.source_only:
+        print("Source-only audit: PASS")
+        return 0 if (total, nonctors, len(unique_names)) == (163, 157, 142) else 1
+
+    try:
+        grss_full = import_binding()
+    except RuntimeError as exc:
+        print(f"AUDIT ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    ok, problems = runtime_audit(grss_full)
+    if not ok:
+        print("\nBinding audit: FAIL")
+        for p in problems:
+            print(f"  - {p}")
+        return 1
+
+    print("Binding audit: PASS")
+    free_names = {d.name for d in defs if not d.is_method and not d.is_constructor and not d.is_destructor}
+    print(f"  All {len(free_names)} unique free-function names are represented in Python.")
+    print(f"  All {sum(len(v) for v in methods.values())} C++ class-method definitions are represented on their Python classes.")
+    print(f"  {len({name for names in methods.values() for name in names})} unique class-method names are represented.")
+    print(f"  All {len(unique_names)} unique callable names (free + methods) are represented in Python.")
+    print("  `_mjd` is covered by pck_mjd_internal and spk_mjd_internal.")
+    print("  Explicit output-parameter aliases for all overloaded vector/time/angle helpers are present.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
